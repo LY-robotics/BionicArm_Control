@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sanpo-arm-control"
+version = "1.0.0"
+description = "Five-axis motion control for the SANPO dual-F4 integrated board"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+authors = [
+  { name = "LY Robotics" },
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "matplotlib>=3.8,<4",
+  "numpy>=1.24,<3",
+  "pyserial>=3.5,<4",
+]
+
+[project.urls]
+Repository = "https://github.com/LY-robotics/BionicArm_Control"
+Documentation = "https://github.com/LY-robotics/BionicArm_Control/tree/main/docs"
+
+[project.scripts]
+sanpo-arm-dashboard = "arm_dashboard:main"
+sanpo-arm-menu = "arm_menu:main"
+sanpo-arm-gripper-demo = "examples.dual_arm_gripper_chain:main"
+sanpo-arm-gripper-probe = "examples.probe_gloria_can:main"
+sanpo-arm-smoke-test = "examples.smoke_test:main"
+
+[tool.setuptools]
+py-modules = ["arm_dashboard", "arm_menu"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sanpo_arm_sdk*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

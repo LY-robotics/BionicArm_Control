@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+.coverage
+.idea/
+.vscode/
+build/
+dist/
+*.csv
+*.log
+sanpo_feedback_*.png

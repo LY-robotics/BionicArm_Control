@@ -21,8 +21,9 @@ from __future__ import annotations
 import struct
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 try:
     import serial
@@ -35,8 +36,10 @@ except ImportError as exc:  # pragma: no cover
 # USB2CAN传输层
 # -----------------------------
 
-HEADER_ADVANCED = bytes([0x41, 0x54])  # 'A' 'T' 高级模式包头
+HEADER_ADVANCED = bytes([0x41, 0x54])  # 'A' 'T' 兼容高级模式包头
+HEADER_STANDARD = bytes([0x53, 0x54])  # 'S' 'T' V4.1+ 标准帧包头
 TAIL = bytes([0x0D, 0x0A])             # CR LF 包尾
+USB_MODES = ("advanced", "standard")
 
 
 def fmt_hex(data: bytes) -> str:
@@ -56,10 +59,14 @@ class CanFrame:
     data: bytes            # 数据负载
     is_extended: bool = False  # 是否为扩展帧(29位ID)
     is_remote: bool = False    # 是否为远程帧
+    channel: int = 0           # SANPO 板卡物理 CAN 通道
 
     def __str__(self) -> str:
         kind = "EXT" if self.is_extended else "STD"
-        return f"{kind} ID=0x{self.can_id:X} DLC={len(self.data)} DATA={fmt_hex(self.data)}"
+        return (
+            f"{kind} CH={self.channel} ID=0x{self.can_id:X} "
+            f"DLC={len(self.data)} DATA={fmt_hex(self.data)}"
+        )
 
 
 class SerialUsbCanTransport:
@@ -76,26 +83,53 @@ class SerialUsbCanTransport:
         baudrate: int = 1_000_000,
         timeout: float = 0.05,
         debug: bool = False,
+        usb_mode: str = "advanced",
+        channel: int = 0,
     ) -> None:
+        if usb_mode not in USB_MODES:
+            raise ValueError(f"usb_mode 必须是 {USB_MODES} 之一")
+        if not 0 <= int(channel) <= 4:
+            raise ValueError("channel 必须在 0..4 范围内")
         self.port = port          # 串口号
         self.baudrate = baudrate  # 波特率(默认1Mbps)
         self.timeout = timeout    # 串口超时时间
         self.debug = debug        # 调试模式
+        self.usb_mode = usb_mode
+        self.channel = int(channel)
         self.ser: Optional[serial.Serial] = None  # 串口对象
-        self._lock = threading.Lock()             # 线程锁
+        self._lock = threading.RLock()            # 请求与轨迹下发共用的可重入锁
+        self._rx_buffer = bytearray()             # 跨串口 read 保留半帧
 
     def connect(self) -> None:
-        """连接到USB2CAN板卡并切换到高级模式"""
+        """连接到 USB2CAN 板卡并设置所选 USB 协议模式。"""
+        if self.ser is not None and self.ser.is_open:
+            return
         self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
         time.sleep(0.05)
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
-        self.set_advanced_mode()
+        if self.usb_mode == "advanced":
+            self.set_advanced_mode()
+        else:
+            self.set_standard_mode()
 
     def close(self) -> None:
         """关闭串口连接"""
         if self.ser and self.ser.is_open:
             self.ser.close()
+
+    @property
+    def is_open(self) -> bool:
+        """Return whether the underlying F4 USB serial port is open."""
+
+        return bool(self.ser is not None and self.ser.is_open)
+
+    @contextmanager
+    def batch(self):
+        """Keep a related group of CAN frames contiguous on this serial port."""
+
+        with self._lock:
+            yield
 
     def __enter__(self) -> "SerialUsbCanTransport":
         """支持上下文管理器进入"""
@@ -151,6 +185,18 @@ class SerialUsbCanTransport:
                 print("警告: AT+AT未返回OK")
         return resp
 
+    def set_standard_mode(self) -> bytes:
+        """将 V4.1+ 固件切换到 ST/ET 正常模式。"""
+        ser = self._require_serial()
+        ser.reset_input_buffer()
+        ser.write(b"AT+ET\r\n")
+        ser.flush()
+        time.sleep(0.1)
+        resp = ser.read_all()
+        if self.debug:
+            print("标准模式切换响应:", resp)
+        return resp
+
     def build_advanced_packet(self, can_id: int, data: bytes) -> bytes:
         """构建高级模式USB数据包"""
         if not 0 <= len(data) <= 8:
@@ -158,65 +204,201 @@ class SerialUsbCanTransport:
         frame_id = self.build_std_frame_identifier(can_id)
         return HEADER_ADVANCED + frame_id + bytes([len(data)]) + data + TAIL
 
-    def send_std(self, can_id: int, data: bytes, flush_rx: bool = True) -> None:
-        """发送一个标准CAN数据帧"""
-        ser = self._require_serial()
-        packet = self.build_advanced_packet(can_id, data)
-        if flush_rx:
-            ser.reset_input_buffer()
-        if self.debug:
-            print(f"发送USB: {fmt_hex(packet)}")
-            print(f"发送CAN: STD ID=0x{can_id:X} DLC={len(data)} DATA={fmt_hex(data)}")
-        ser.write(packet)
-        ser.flush()
+    def build_standard_packet(
+        self,
+        can_id: int,
+        data: bytes,
+        *,
+        channel: Optional[int] = None,
+    ) -> bytes:
+        """构建 V4.1+ USB CDC 标准 CAN 帧数据包。"""
+        if not 0 <= can_id <= 0x7FF:
+            raise ValueError("标准CAN ID必须在0..0x7FF范围内")
+        if not 0 <= len(data) <= 8:
+            raise ValueError("CAN数据长度必须在0..8字节之间")
+        selected_channel = self.channel if channel is None else int(channel)
+        if not 0 <= selected_channel <= 4:
+            raise ValueError("channel 必须在 0..4 范围内")
+        return (
+            HEADER_STANDARD
+            + bytes([selected_channel])
+            + b"\x00\x00"
+            + can_id.to_bytes(2, byteorder="big", signed=False)
+            + bytes([len(data)])
+            + data
+            + TAIL
+        )
 
-    def read_frames(self, timeout: float = 0.2) -> List[CanFrame]:
-        """读取超时时间内收到的所有高级模式CAN帧"""
-        ser = self._require_serial()
-        deadline = time.monotonic() + timeout
-        buf = bytearray()
-        while time.monotonic() < deadline:
-            waiting = ser.in_waiting
-            chunk = ser.read(waiting or 1)
-            if chunk:
-                buf.extend(chunk)
-            else:
-                time.sleep(0.002)
-        frames = self._parse_advanced_frames(bytes(buf))
-        if self.debug:
-            if buf:
-                print(f"接收USB: {fmt_hex(bytes(buf))}")
-            for fr in frames:
-                print(f"接收CAN: {fr}")
-        return frames
+    def build_packet(
+        self,
+        can_id: int,
+        data: bytes,
+        *,
+        channel: Optional[int] = None,
+    ) -> bytes:
+        """按当前 USB 模式构建一个标准 CAN 帧数据包。"""
+        if self.usb_mode == "standard":
+            return self.build_standard_packet(can_id, data, channel=channel)
+        return self.build_advanced_packet(can_id, data)
+
+    def send_std(
+        self,
+        can_id: int,
+        data: bytes,
+        flush_rx: bool = True,
+        *,
+        channel: Optional[int] = None,
+    ) -> None:
+        """发送一个标准CAN数据帧"""
+        with self._lock:
+            ser = self._require_serial()
+            selected_channel = self.channel if channel is None else int(channel)
+            packet = self.build_packet(can_id, data, channel=selected_channel)
+            if flush_rx:
+                ser.reset_input_buffer()
+                self._rx_buffer.clear()
+            if self.debug:
+                print(f"发送USB: {fmt_hex(packet)}")
+                print(
+                    f"发送CAN: STD CH={selected_channel} ID=0x{can_id:X} "
+                    f"DLC={len(data)} DATA={fmt_hex(data)}"
+                )
+            ser.write(packet)
+            ser.flush()
+
+    def read_frames(
+        self,
+        timeout: float = 0.2,
+        *,
+        return_on_frame: bool = False,
+    ) -> List[CanFrame]:
+        """Read CAN frames while preserving fragmented USB packets.
+
+        ``return_on_frame`` is used by synchronous device requests so the
+        shared F4 serial lock is released as soon as a complete response is
+        available instead of waiting out the entire timeout.
+        """
+        with self._lock:
+            ser = self._require_serial()
+            deadline = time.monotonic() + timeout
+            frames: List[CanFrame] = []
+            while time.monotonic() < deadline:
+                waiting = ser.in_waiting
+                chunk = ser.read(waiting or 1)
+                if chunk:
+                    self._rx_buffer.extend(chunk)
+                    parsed = (
+                        self._consume_standard_buffer(self._rx_buffer)
+                        if self.usb_mode == "standard"
+                        else self._consume_advanced_buffer(self._rx_buffer)
+                    )
+                    frames.extend(parsed)
+                    if return_on_frame and frames:
+                        break
+                else:
+                    time.sleep(0.002)
+            if self.debug:
+                if frames:
+                    print(f"接收USB帧数: {len(frames)}")
+                for fr in frames:
+                    print(f"接收CAN: {fr}")
+            return frames
 
     @staticmethod
     def _parse_advanced_frames(raw: bytes) -> List[CanFrame]:
         """解析原始字节流中的CAN帧"""
+        return SerialUsbCanTransport._consume_advanced_buffer(bytearray(raw))
+
+    @staticmethod
+    def _consume_advanced_buffer(buffer: bytearray) -> List[CanFrame]:
+        """Consume complete AT frames and retain a trailing partial frame."""
+
         frames: List[CanFrame] = []
-        i = 0
-        n = len(raw)
-        while i < n:
-            start = raw.find(HEADER_ADVANCED, i)
+        while True:
+            start = buffer.find(HEADER_ADVANCED)
             if start < 0:
+                if buffer[-1:] == HEADER_ADVANCED[:1]:
+                    buffer[:] = HEADER_ADVANCED[:1]
+                else:
+                    buffer.clear()
                 break
-            # 至少需要包头+帧ID+数据长度字节
-            if start + 2 + 4 + 1 > n:
+            if start:
+                del buffer[:start]
+            if len(buffer) < 7:
                 break
-            frame_id = raw[start + 2 : start + 6]
-            dlc = raw[start + 6]
-            end_data = start + 7 + dlc
-            end_tail = end_data + 2
-            if dlc > 8 or end_tail > n:
-                i = start + 1
+            dlc = buffer[6]
+            if dlc > 8:
+                del buffer[0]
                 continue
-            if raw[end_data:end_tail] != TAIL:
-                i = start + 1
+            frame_length = 9 + dlc
+            if len(buffer) < frame_length:
+                break
+            end_data = 7 + dlc
+            if buffer[end_data:frame_length] != TAIL:
+                del buffer[0]
                 continue
-            data = raw[start + 7 : end_data]
-            can_id, is_ext, is_remote = SerialUsbCanTransport.parse_frame_identifier(frame_id)
-            frames.append(CanFrame(can_id=can_id, data=data, is_extended=is_ext, is_remote=is_remote))
-            i = end_tail
+            frame_id = bytes(buffer[2:6])
+            data = bytes(buffer[7:end_data])
+            can_id, is_ext, is_remote = (
+                SerialUsbCanTransport.parse_frame_identifier(frame_id)
+            )
+            frames.append(
+                CanFrame(
+                    can_id=can_id,
+                    data=data,
+                    is_extended=is_ext,
+                    is_remote=is_remote,
+                    channel=0,
+                )
+            )
+            del buffer[:frame_length]
+        return frames
+
+    @staticmethod
+    def _parse_standard_frames(raw: bytes) -> List[CanFrame]:
+        """解析 V4.1+ ST 标准 CAN 帧字节流。"""
+        return SerialUsbCanTransport._consume_standard_buffer(bytearray(raw))
+
+    @staticmethod
+    def _consume_standard_buffer(buffer: bytearray) -> List[CanFrame]:
+        """Consume complete ST frames and retain a trailing partial frame."""
+
+        frames: List[CanFrame] = []
+        while True:
+            start = buffer.find(HEADER_STANDARD)
+            if start < 0:
+                if buffer[-1:] == HEADER_STANDARD[:1]:
+                    buffer[:] = HEADER_STANDARD[:1]
+                else:
+                    buffer.clear()
+                break
+            if start:
+                del buffer[:start]
+            if len(buffer) < 8:
+                break
+            channel = buffer[2]
+            can_id = int.from_bytes(
+                buffer[5:7], byteorder="big", signed=False
+            ) & 0x7FF
+            dlc = buffer[7]
+            if dlc > 8:
+                del buffer[0]
+                continue
+            frame_length = 10 + dlc
+            if len(buffer) < frame_length:
+                break
+            end_data = 8 + dlc
+            if buffer[end_data:frame_length] != TAIL:
+                del buffer[0]
+                continue
+            frames.append(
+                CanFrame(
+                    can_id=can_id,
+                    data=bytes(buffer[8:end_data]),
+                    channel=channel,
+                )
+            )
+            del buffer[:frame_length]
         return frames
 
     def request(
@@ -226,23 +408,120 @@ class SerialUsbCanTransport:
         expect_reply_id: Optional[int] = None,
         expect_cmd: Optional[int] = None,
         timeout: float = 0.25,
+        *,
+        channel: Optional[int] = None,
+        expect_reply_channel: Optional[int] = None,
+        match: Optional[Callable[[CanFrame], bool]] = None,
     ) -> Optional[CanFrame]:
         """
         发送CAN帧并返回第一个匹配的回复。
         如果未指定过滤条件，返回收到的第一个帧。
         """
         with self._lock:
-            self.send_std(can_id, data, flush_rx=True)
-            frames = self.read_frames(timeout=timeout)
+            self.send_std(can_id, data, flush_rx=True, channel=channel)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                frames = self.read_frames(
+                    timeout=max(0.0, deadline - time.monotonic()),
+                    return_on_frame=True,
+                )
+                if not frames:
+                    break
+                for fr in frames:
+                    if (
+                        expect_reply_channel is not None
+                        and fr.channel != expect_reply_channel
+                    ):
+                        continue
+                    if (
+                        expect_reply_id is not None
+                        and fr.can_id != expect_reply_id
+                    ):
+                        continue
+                    if expect_cmd is not None:
+                        if not fr.data or fr.data[0] != expect_cmd:
+                            continue
+                    if match is not None and not match(fr):
+                        continue
+                    return fr
+                if (
+                    expect_reply_channel is None
+                    and expect_reply_id is None
+                    and expect_cmd is None
+                    and match is None
+                ):
+                    return frames[0]
+            return None
 
-        for fr in frames:
-            if expect_reply_id is not None and fr.can_id != expect_reply_id:
-                continue
-            if expect_cmd is not None:
-                if not fr.data or fr.data[0] != expect_cmd:
-                    continue
-            return fr
-        return frames[0] if frames and expect_reply_id is None and expect_cmd is None else None
+    def channel_endpoint(self, channel: int) -> "CanChannelTransport":
+        """Bind one logical endpoint to one physical CAN connector.
+
+        The two endpoints on one F4 share this transport's serial ownership and
+        transaction lock, while every CAN request remains channel-filtered.
+        """
+
+        if self.usb_mode != "standard":
+            raise ValueError("多 CAN 通道必须使用 ST 标准模式")
+        return CanChannelTransport(self, channel)
+
+
+class CanChannelTransport:
+    """Channel-bound view of one F4 USB CDC transport.
+
+    This object does not own or close the serial port.  It lets an arm and an
+    end effector use separate physical CAN connectors while sharing one F4 COM
+    port safely.
+    """
+
+    def __init__(self, parent: SerialUsbCanTransport, channel: int) -> None:
+        if not 1 <= int(channel) <= 4:
+            raise ValueError("独立设备的 CAN channel 必须在 1..4 范围内")
+        self.parent = parent
+        self.channel = int(channel)
+        self.port = parent.port
+        self.usb_mode = parent.usb_mode
+
+    @property
+    def is_open(self) -> bool:
+        return self.parent.is_open
+
+    def connect(self) -> None:
+        self.parent.connect()
+
+    def close(self) -> None:
+        """Do not close the shared F4 serial port from a child endpoint."""
+
+    def batch(self):
+        return self.parent.batch()
+
+    def send_std(self, can_id: int, data: bytes, flush_rx: bool = True) -> None:
+        self.parent.send_std(
+            can_id,
+            data,
+            flush_rx=flush_rx,
+            channel=self.channel,
+        )
+
+    def request(
+        self,
+        can_id: int,
+        data: bytes,
+        expect_reply_id: Optional[int] = None,
+        expect_cmd: Optional[int] = None,
+        timeout: float = 0.25,
+        *,
+        match: Optional[Callable[[CanFrame], bool]] = None,
+    ) -> Optional[CanFrame]:
+        return self.parent.request(
+            can_id,
+            data,
+            expect_reply_id=expect_reply_id,
+            expect_cmd=expect_cmd,
+            timeout=timeout,
+            channel=self.channel,
+            expect_reply_channel=self.channel,
+            match=match,
+        )
 
 
 # -----------------------------
@@ -585,6 +864,10 @@ class CanMotor:
         """绝对位置移动(以电机角度为单位)"""
         return self.move_absolute_counts(deg_to_counts(motor_deg))
 
+    def command_absolute_motor_deg(self, motor_deg: float) -> None:
+        """快速下发绝对位置，不等待电机回复，供轨迹流式执行使用。"""
+        self._cmd_s32(0xC2, deg_to_counts(motor_deg), expect_reply=False)
+
     def move_relative_counts(self, counts: int) -> Optional[Dict[str, float]]:
         """相对位置移动(以编码器计数为单位)(C3)"""
         fr = self._cmd_s32(0xC3, counts)
@@ -696,6 +979,7 @@ class CanArm:
         joints: Sequence[JointConfig],
         name: str = "arm",
         use_host_id_offset: bool = True,
+        response_timeout: float = 0.08,
     ) -> None:
         if len(joints) == 0:
             raise ValueError("关节列表不能为空")
@@ -703,7 +987,13 @@ class CanArm:
         self.name = name                  # 机械臂名称
         self.joints: Dict[str, JointConfig] = {j.key: j for j in joints}  # 关节配置字典
         self.motors: Dict[str, CanMotor] = {
-            j.key: CanMotor(bus, j.motor_id, name=f"{name}.{j.key}", use_host_id_offset=use_host_id_offset)
+            j.key: CanMotor(
+                bus,
+                j.motor_id,
+                name=f"{name}.{j.key}",
+                use_host_id_offset=use_host_id_offset,
+                response_timeout=response_timeout,
+            )
             for j in joints
         }  # 电机对象字典
         self.current_deg: Dict[str, float] = {j.key: 0.0 for j in joints}  # 当前角度缓存
@@ -787,6 +1077,35 @@ class CanArm:
         return ret
 
     # ---- 读取 ----
+
+    def read_joint_angle(self, key: str) -> Optional[float]:
+        """只读取关节多圈角度，适合轨迹起点和到位判断。"""
+        angle = self._motor(key).read_angle()
+        if angle is None:
+            return None
+        angle_deg = self.motor_deg_to_logic_deg(key, float(angle["multi_deg"]))
+        self.current_deg[key] = angle_deg
+        return angle_deg
+
+    def read_joint_motion_feedback(self, key: str) -> JointFeedback:
+        """读取运动所需的角度、速度和 Q 轴电流，不额外查询完整状态。"""
+        cfg = self._cfg(key)
+        motor = self._motor(key)
+        angle_deg = self.read_joint_angle(key)
+        motor_speed = motor.read_speed_rpm()
+        speed_rpm = None
+        if motor_speed is not None:
+            speed_rpm = (
+                motor_speed / cfg.ratio * self._check_dir(cfg.direction)
+            )
+        return JointFeedback(
+            key=key,
+            motor_id=cfg.motor_id,
+            angle_deg=angle_deg,
+            speed_rpm=speed_rpm,
+            q_current_a=motor.read_q_current(),
+            status=None,
+        )
 
     def read_joint_feedback(self, key: str) -> JointFeedback:
         """读取单个关节的反馈数据"""
@@ -883,6 +1202,22 @@ class CanArm:
             ret[key] = self.move_absolute(key, deg)
             time.sleep(delay_s)
         return ret
+
+    def command_many_absolute(
+        self,
+        targets: Dict[str, float],
+        delay_s: float = 0.0,
+    ) -> None:
+        """快速下发多个关节目标，不等待逐关节回复。"""
+        for key, deg in targets.items():
+            self.check_limit(key, deg)
+
+        for key, deg in targets.items():
+            motor_deg = self.logic_deg_to_motor_deg(key, deg)
+            self._motor(key).command_absolute_motor_deg(motor_deg)
+            self.current_deg[key] = float(deg)
+            if delay_s > 0.0:
+                time.sleep(delay_s)
 
     def home(self, delay_s: float = 0.05) -> Dict[str, Optional[Dict[str, float]]]:
         """所有关节回零(移动到0度)"""
