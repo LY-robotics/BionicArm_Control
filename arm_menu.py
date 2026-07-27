@@ -184,7 +184,7 @@ def show_current_pose(arm: ArmController) -> None:
     if err == OK and pose is not None:
         print(
             f"  position_mm = [{pose.x:.3f}, {pose.y:.3f}, {pose.z:.3f}]\n"
-            f"  pitch_deg   = {pose.pitch_deg:.3f}"
+            f"  yaw_deg     = {pose.yaw_deg:.3f} (positive right)"
         )
 
 
@@ -201,7 +201,7 @@ def show_motor_status(arm: ArmController) -> None:
 
 def move_cartesian(arm: ArmController) -> None:
     target = prompt_values(
-        "输入 x y z [pitch] [j5]，位置单位 mm、角度单位 deg: ",
+        "输入 x y z [yaw] [j5]，yaw 正值向右、负值向左: ",
         allowed_counts=(3, 4, 5),
     )
     speed = float(input("关节轨迹速度上限 deg/s [10]: ").strip() or "10")
@@ -280,7 +280,7 @@ def set_joint_parameter(arm: ArmController, *, acceleration: bool) -> None:
 
 def preview_ik(arm: ArmController) -> None:
     target = prompt_values(
-        "输入 x y z [pitch] [j5]，仅计算不运动: ",
+        "输入 x y z [yaw] [j5]，仅计算不运动（右正左负）: ",
         allowed_counts=(3, 4, 5),
     )
     err, result = arm.preview_ik(target)
@@ -290,6 +290,8 @@ def preview_ik(arm: ArmController) -> None:
         print(f"  success={result.success}")
         print(f"  q_deg=[{joints}]")
         print(f"  position_error_norm_mm={result.error_norm_mm:.6f}")
+        print(f"  yaw_deg={result.yaw_deg:.6f} (positive right)")
+        print(f"  yaw_error_deg={result.yaw_error_deg}")
         print(f"  message={result.message}")
 
 
@@ -303,7 +305,7 @@ def preview_fk(arm: ArmController) -> None:
     if pose is not None:
         print(
             f"  position_mm=[{pose.x:.3f}, {pose.y:.3f}, {pose.z:.3f}]\n"
-            f"  pitch_deg={pose.pitch_deg:.3f}"
+            f"  yaw_deg={pose.yaw_deg:.3f} (positive right)"
         )
 
 

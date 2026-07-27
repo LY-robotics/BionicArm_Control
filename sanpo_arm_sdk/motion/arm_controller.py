@@ -46,7 +46,7 @@ from ..kinematics.kinematic_5dof import (
     IKResult,
     forward_kinematics,
     inverse_kinematics,
-    recommend_feasible_pitch_j5,
+    recommend_feasible_yaw,
 )
 from ..settings import LINE_DEFAULTS
 
@@ -889,15 +889,15 @@ class ArmController:
         try:
             velocity = self._motion_limit_array(speed, "speed")
             acceleration = self._motion_limit_array(accel, "accel")
-            position, pitch, j5 = self._parse_cartesian_target(target_pose)
+            position, yaw, j5 = self._parse_cartesian_target(target_pose)
             q_start = self._current_joint_array()
             recommendation: IKRecommendResult | None = None
             planning_target: object = target_pose
 
-            if allow_recommendation and pitch is not None and j5 is not None:
-                recommendation = recommend_feasible_pitch_j5(
+            if allow_recommendation and yaw is not None and j5 is not None:
+                recommendation = recommend_feasible_yaw(
                     position,
-                    pitch,
+                    yaw,
                     j5,
                     q_start,
                     q_reference=q_start,
@@ -908,7 +908,7 @@ class ArmController:
                     return ERR_IK_NO_SOLUTION, None
                 planning_target = [
                     *position,
-                    recommendation.recommended_pitch_deg,
+                    recommendation.recommended_yaw_deg,
                     recommendation.recommended_j5_deg,
                 ]
 
@@ -964,12 +964,12 @@ class ArmController:
         try:
             velocity = self._motion_limit_array(speed, "speed")
             acceleration = self._motion_limit_array(accel, "accel")
-            position, pitch, j5 = self._parse_cartesian_target(target_pose)
+            position, yaw, j5 = self._parse_cartesian_target(target_pose)
             q_start = self._current_joint_array()
             line_plan = plan_cartesian_line_trajectory(
                 q_start,
                 position,
-                reference_pitch_deg=pitch,
+                target_yaw_deg=yaw,
                 target_j5_deg=j5,
                 velocity_limit_deg_s=velocity,
                 acceleration_limit_deg_s2=acceleration,
@@ -1194,7 +1194,7 @@ class ArmController:
         tol_deg: float = 1.0,
         recommendation_config: Optional[IKRecommendConfig] = None,
     ) -> int:
-        """Move to the nearest feasible pitch/J5 pose when the request is infeasible."""
+        """Move to the nearest feasible yaw while keeping J5 fixed."""
 
         if self.is_moving:
             return self._return_motion_error(ERR_MOTION_BUSY)
@@ -1310,21 +1310,21 @@ class ArmController:
                     target_pose["y"],
                     target_pose["z"],
                 ]
-            pitch = target_pose.get("pitch_deg", target_pose.get("pitch"))
+            yaw = target_pose.get("yaw_deg", target_pose.get("yaw"))
             j5 = target_pose.get("j5_deg", target_pose.get("j5"))
         else:
             array = np.asarray(target_pose, dtype=float).reshape(-1)
             if array.size not in (3, 4, 5):
-                raise ValueError("Target must have x, y, z and optional pitch/J5")
+                raise ValueError("Target must have x, y, z and optional yaw/J5")
             position = array[:3]
-            pitch = None if array.size < 4 else float(array[3])
+            yaw = None if array.size < 4 else float(array[3])
             j5 = None if array.size < 5 else float(array[4])
         position_array = np.asarray(position, dtype=float).reshape(-1)
         if position_array.size != 3 or not np.all(np.isfinite(position_array)):
             raise ValueError("Position must contain three finite values")
         return (
             position_array,
-            None if pitch is None else float(pitch),
+            None if yaw is None else float(yaw),
             None if j5 is None else float(j5),
         )
 
@@ -1335,12 +1335,12 @@ class ArmController:
         ik_options: Optional[IKOptions] = None,
     ) -> tuple[int, Optional[IKResult]]:
         try:
-            position, pitch, j5 = self._parse_cartesian_target(target_pose)
+            position, yaw, j5 = self._parse_cartesian_target(target_pose)
             q_start = self._current_joint_array()
             result = inverse_kinematics(
                 position,
                 q_seed=q_start,
-                target_pitch_deg=pitch,
+                target_yaw_deg=yaw,
                 target_j5_deg=j5,
                 q_reference=q_start,
                 options=ik_options,
@@ -1359,16 +1359,16 @@ class ArmController:
         *,
         config: Optional[IKRecommendConfig] = None,
     ) -> tuple[int, Optional[IKRecommendResult]]:
-        """Return the requested IK or the nearest feasible pitch/J5 alternative."""
+        """Return strict IK or the nearest feasible yaw with J5 unchanged."""
 
         try:
-            position, pitch, j5 = self._parse_cartesian_target(target_pose)
-            if pitch is None or j5 is None:
+            position, yaw, j5 = self._parse_cartesian_target(target_pose)
+            if yaw is None or j5 is None:
                 return ERR_INVALID_ARGUMENT, None
             q_start = self._current_joint_array()
-            result = recommend_feasible_pitch_j5(
+            result = recommend_feasible_yaw(
                 position,
-                pitch,
+                yaw,
                 j5,
                 q_start,
                 q_reference=q_start,

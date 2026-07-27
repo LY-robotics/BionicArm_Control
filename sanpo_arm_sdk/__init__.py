@@ -1,6 +1,6 @@
 """SANPO dual-F4 five-axis arm motion-control SDK."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .config import (
     ARM_PROFILES,

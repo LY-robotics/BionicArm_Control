@@ -62,7 +62,7 @@ class CartesianTrajectory:
     joint_trajectory: JointTrajectory
     ik_result: IKResult
     target_position_mm: np.ndarray
-    target_pitch_deg: float | None
+    target_yaw_deg: float | None
     target_j5_deg: float | None
 
 
@@ -348,7 +348,7 @@ def _mapping_first(mapping: dict, *keys: str) -> object | None:
 def _cartesian_pose_to_ik_target(
     target_pose: object,
 ) -> tuple[np.ndarray, float | None, float | None]:
-    """Parse [x, y, z], [x, y, z, pitch], [x, y, z, pitch, j5] or dict pose."""
+    """Parse ``[x, y, z, yaw, j5]`` or an equivalent mapping."""
     if isinstance(target_pose, dict):
         position_value = _mapping_first(
             target_pose, "position_mm", "target_mm", "target_tcp_mm", "tcp_mm"
@@ -366,9 +366,9 @@ def _cartesian_pose_to_ik_target(
                 ) from exc
 
         position = np.asarray(position_value, dtype=float).reshape(-1)
-        pitch = _optional_float(
-            _mapping_first(target_pose, "pitch_deg", "pitch", "target_pitch_deg"),
-            "target_pitch_deg",
+        yaw = _optional_float(
+            _mapping_first(target_pose, "yaw_deg", "yaw", "target_yaw_deg"),
+            "target_yaw_deg",
         )
         j5 = _optional_float(
             _mapping_first(target_pose, "j5_deg", "j5", "target_j5_deg"),
@@ -376,24 +376,24 @@ def _cartesian_pose_to_ik_target(
         )
     elif hasattr(target_pose, "position_mm"):
         position = np.asarray(target_pose.position_mm, dtype=float).reshape(-1)
-        pitch = _optional_float(getattr(target_pose, "pitch_deg", None), "pitch_deg")
+        yaw = _optional_float(getattr(target_pose, "yaw_deg", None), "yaw_deg")
         j5 = _optional_float(getattr(target_pose, "j5_deg", None), "j5_deg")
     else:
         array = np.asarray(target_pose, dtype=float).reshape(-1)
         if array.size not in (3, 4, 5):
             raise ValueError(
-                "target_pose must be [x, y, z], [x, y, z, pitch], "
-                "or [x, y, z, pitch, j5]"
+                "target_pose must be [x, y, z], [x, y, z, yaw], "
+                "or [x, y, z, yaw, j5]"
             )
         position = array[:3]
-        pitch = None if array.size < 4 else _optional_float(array[3], "pitch_deg")
+        yaw = None if array.size < 4 else _optional_float(array[3], "yaw_deg")
         j5 = None if array.size < 5 else _optional_float(array[4], "j5_deg")
 
     if position.size != 3:
         raise ValueError("target Cartesian position must contain x, y, z")
     if not np.all(np.isfinite(position)):
         raise ValueError("target Cartesian position contains NaN or infinity")
-    return position, pitch, j5
+    return position, yaw, j5
 
 
 def plan_cartesian_point_to_point_trajectory(
@@ -414,7 +414,7 @@ def plan_cartesian_point_to_point_trajectory(
 ) -> CartesianTrajectory:
     """Plan a point-to-point Cartesian move through IK then joint interpolation."""
     q0 = _joint_to_array(q_start)
-    target_position, target_pitch, target_j5 = _cartesian_pose_to_ik_target(
+    target_position, target_yaw, target_j5 = _cartesian_pose_to_ik_target(
         target_pose
     )
     reference = q0 if q_reference is None else _joint_to_array(q_reference)
@@ -422,7 +422,7 @@ def plan_cartesian_point_to_point_trajectory(
     ik_result = inverse_kinematics(
         target_position,
         q_seed=q0,
-        target_pitch_deg=target_pitch,
+        target_yaw_deg=target_yaw,
         target_j5_deg=target_j5,
         q_reference=reference,
         options=ik_options,
@@ -448,7 +448,7 @@ def plan_cartesian_point_to_point_trajectory(
         joint_trajectory=joint_trajectory,
         ik_result=ik_result,
         target_position_mm=target_position.copy(),
-        target_pitch_deg=target_pitch,
+        target_yaw_deg=target_yaw,
         target_j5_deg=ik_result.target_j5_deg,
     )
 

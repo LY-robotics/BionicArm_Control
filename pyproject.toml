@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sanpo-arm-control"
-version = "1.0.0"
+version = "1.1.0"
 description = "Five-axis motion control for the SANPO dual-F4 integrated board"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"

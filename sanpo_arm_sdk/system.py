@@ -116,8 +116,8 @@ def create_dual_f4_system(
     baudrate: int = 1_000_000,
     left_arm_channel: int = 1,
     left_gripper_channel: int = 2,
-    right_arm_channel: int = 3,
-    right_gripper_channel: int = 4,
+    right_arm_channel: int = 1,
+    right_gripper_channel: int = 2,
     left_gripper_enabled: bool = True,
     right_gripper_enabled: bool = True,
     left_gripper_config: GloriaGripperConfig | None = None,
@@ -127,7 +127,7 @@ def create_dual_f4_system(
     use_host_id_offset: bool = True,
     debug: bool = False,
 ) -> DualF4System:
-    """Create the production dual-F4 topology using ST channel routing."""
+    """Create the production dual-F4 topology using local ST channels 1 and 2."""
 
     if left_gripper_enabled and left_arm_channel == left_gripper_channel:
         raise ValueError("左臂和左夹爪必须使用不同 CAN 通道")

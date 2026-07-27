@@ -41,7 +41,7 @@ from sanpo_arm_sdk.kinematics import (
     compare_tcp_positions,
     export_ideal_model_csv,
     inverse_kinematics,
-    recommend_feasible_pitch_j5,
+    recommend_feasible_yaw,
 )
 from sanpo_arm_sdk.settings import (
     LINE_DEFAULTS,
@@ -96,7 +96,7 @@ class TargetPanel(ttk.LabelFrame):
         labels = (
             ("J1 (deg)", "J2 (deg)", "J3 (deg)", "J4 (deg)", "J5 (deg)")
             if mode == "joint"
-            else ("X (mm)", "Y (mm)", "Z (mm)", "Pitch (deg)", "J5 (deg)")
+            else ("X (mm)", "Y (mm)", "Z (mm)", "Yaw (deg)", "J5 (deg)")
         )
         for label, text in zip(self.labels, labels):
             label.configure(text=text)
@@ -108,8 +108,8 @@ class TargetPanel(ttk.LabelFrame):
         for variable, value in zip(self.variables, values):
             variable.set(f"{float(value):.4f}")
 
-    def set_recommended_pitch_j5(self, pitch_deg: float, j5_deg: float) -> None:
-        self.variables[3].set(f"{pitch_deg:.4f}")
+    def set_recommended_yaw_j5(self, yaw_deg: float, j5_deg: float) -> None:
+        self.variables[3].set(f"{yaw_deg:.4f}")
         self.variables[4].set(f"{j5_deg:.4f}")
 
 
@@ -213,10 +213,9 @@ class ArmDashboard(tk.Tk):
         self.branch_jump_var = tk.StringVar(value=str(LINE_DEFAULTS.max_branch_jump_deg))
         self.allow_recommendation_var = tk.BooleanVar(value=True)
         self.synchronize_finish_var = tk.BooleanVar(value=True)
-        self.pitch_min_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.pitch_min_deg))
-        self.pitch_max_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.pitch_max_deg))
-        self.pitch_step_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.pitch_step_deg))
-        self.j5_step_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.j5_step_deg))
+        self.yaw_min_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.yaw_min_deg))
+        self.yaw_max_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.yaw_max_deg))
+        self.yaw_step_var = tk.StringVar(value=str(RECOMMENDATION_DEFAULTS.yaw_step_deg))
         self.motion_status_var = tk.StringVar(value="等待目标")
         self.arm_zero_joint_var = tk.StringVar(value="j1")
         self.monitor_period_var = tk.StringVar(value=str(TELEMETRY_DEFAULTS.sample_period_s))
@@ -316,12 +315,12 @@ class ArmDashboard(tk.Tk):
         self.baud_entry.grid(row=2, column=3, sticky="ew", padx=(12, 0), pady=5)
         ttk.Label(device, text="左臂 CAN 通道").grid(row=3, column=0, sticky="w", pady=5)
         self.left_channel_spin = ttk.Spinbox(
-            device, from_=1, to=4, textvariable=self.left_channel_var, width=17
+            device, from_=1, to=2, textvariable=self.left_channel_var, width=17
         )
         self.left_channel_spin.grid(row=3, column=1, sticky="ew", padx=(12, 28), pady=5)
         ttk.Label(device, text="右臂 CAN 通道").grid(row=3, column=2, sticky="w", pady=5)
         self.right_channel_spin = ttk.Spinbox(
-            device, from_=1, to=4, textvariable=self.right_channel_var, width=17
+            device, from_=1, to=2, textvariable=self.right_channel_var, width=17
         )
         self.right_channel_spin.grid(row=3, column=3, sticky="ew", padx=(12, 0), pady=5)
         self.left_gripper_enabled_check = ttk.Checkbutton(
@@ -336,7 +335,7 @@ class ArmDashboard(tk.Tk):
         self.left_gripper_channel_spin = ttk.Spinbox(
             device,
             from_=1,
-            to=4,
+            to=2,
             textvariable=self.left_gripper_channel_var,
             width=17,
         )
@@ -359,7 +358,7 @@ class ArmDashboard(tk.Tk):
         self.right_gripper_channel_spin = ttk.Spinbox(
             device,
             from_=1,
-            to=4,
+            to=2,
             textvariable=self.right_gripper_channel_var,
             width=17,
         )
@@ -752,7 +751,7 @@ class ArmDashboard(tk.Tk):
         ).pack(side="left", padx=8)
         ttk.Checkbutton(
             selector,
-            text="无解时推荐 Pitch/J5",
+            text="无解时推荐 Yaw（J5 保持不变）",
             variable=self.model_use_recommendation_var,
         ).pack(side="left", padx=(8, 0))
 
@@ -762,7 +761,7 @@ class ArmDashboard(tk.Tk):
         self.model_target_panel.set_values(
             [
                 *default_model.tcp_position_mm,
-                default_model.pose.pitch_deg,
+                default_model.pose.yaw_deg,
                 default_model.q_deg[4],
             ]
         )
@@ -990,10 +989,9 @@ class ArmDashboard(tk.Tk):
         self._parameter_grid(
             recommendation,
             (
-                ("Pitch 最小值 (deg)", self.pitch_min_var),
-                ("Pitch 最大值 (deg)", self.pitch_max_var),
-                ("Pitch 搜索步长 (deg)", self.pitch_step_var),
-                ("J5 搜索步长 (deg)", self.j5_step_var),
+                ("Yaw 最小值 (deg)", self.yaw_min_var),
+                ("Yaw 最大值 (deg)", self.yaw_max_var),
+                ("Yaw 搜索步长 (deg)", self.yaw_step_var),
             ),
         )
         self._parameter_grid(
@@ -1509,14 +1507,13 @@ class ArmDashboard(tk.Tk):
                 error, pose = arm.forward_pose()
                 if error == OK and pose is not None:
                     j5 = arm.joints["j5"]["current"]
-                    panel.set_values([pose.x, pose.y, pose.z, pose.pitch_deg, j5])
+                    panel.set_values([pose.x, pose.y, pose.z, pose.yaw_deg, j5])
 
     def _recommend_config(self) -> IKRecommendConfig:
         return IKRecommendConfig(
-            pitch_min_deg=float(self.pitch_min_var.get()),
-            pitch_max_deg=float(self.pitch_max_var.get()),
-            pitch_step_deg=float(self.pitch_step_var.get()),
-            j5_step_deg=float(self.j5_step_var.get()),
+            yaw_min_deg=float(self.yaw_min_var.get()),
+            yaw_max_deg=float(self.yaw_max_var.get()),
+            yaw_step_deg=float(self.yaw_step_var.get()),
         )
 
     def _motion_parameters(self) -> dict[str, object]:
@@ -1609,10 +1606,10 @@ class ArmDashboard(tk.Tk):
             if motion.line_plan is not None:
                 summary += f" / 直线偏差峰值 {motion.line_plan.max_line_deviation_mm:.3f} mm"
             if motion.recommendation is not None and (
-                motion.recommendation.changed_pitch or motion.recommendation.changed_j5
+                motion.recommendation.changed_yaw
             ):
                 summary += (
-                    f" / 推荐 Pitch={motion.recommendation.recommended_pitch_deg:.2f}, "
+                    f" / 推荐 Yaw={motion.recommendation.recommended_yaw_deg:.2f}, "
                     f"J5={motion.recommendation.recommended_j5_deg:.2f}"
                 )
             summaries.append(summary)
@@ -1667,7 +1664,7 @@ class ArmDashboard(tk.Tk):
                 model = build_ideal_arm_model(values, check_limits=False)
                 values = [
                     *model.tcp_position_mm,
-                    model.pose.pitch_deg,
+                    model.pose.yaw_deg,
                     values[4],
                 ]
             self.model_target_panel.set_values(values)
@@ -1706,7 +1703,7 @@ class ArmDashboard(tk.Tk):
 
             recommendation = None
             if use_recommendation:
-                recommendation = recommend_feasible_pitch_j5(
+                recommendation = recommend_feasible_yaw(
                     requested_pose[:3],
                     float(requested_pose[3]),
                     float(requested_pose[4]),
@@ -1721,7 +1718,7 @@ class ArmDashboard(tk.Tk):
                 ik_result = inverse_kinematics(
                     requested_pose[:3],
                     q_seed=q_seed,
-                    target_pitch_deg=float(requested_pose[3]),
+                    target_yaw_deg=float(requested_pose[3]),
                     target_j5_deg=float(requested_pose[4]),
                     q_reference=q_seed,
                 )
@@ -1748,15 +1745,15 @@ class ArmDashboard(tk.Tk):
             self.model_recommendation = result["recommendation"]
             recommendation = result["recommendation"]
             if recommendation is not None and (
-                recommendation.changed_pitch or recommendation.changed_j5
+                recommendation.changed_yaw
             ):
-                self.model_target_panel.set_recommended_pitch_j5(
-                    recommendation.recommended_pitch_deg,
+                self.model_target_panel.set_recommended_yaw_j5(
+                    recommendation.recommended_yaw_deg,
                     recommendation.recommended_j5_deg,
                 )
                 self.model_status_var.set(
                     "原姿态无解，模型使用推荐值 "
-                    f"Pitch={recommendation.recommended_pitch_deg:.3f}°, "
+                    f"Yaw={recommendation.recommended_yaw_deg:.3f}°（右正左负）, "
                     f"J5={recommendation.recommended_j5_deg:.3f}°"
                 )
             else:
@@ -2067,11 +2064,11 @@ class ArmDashboard(tk.Tk):
                     messages.append(f"{name}: {err_text(error)}")
                     continue
                 messages.append(
-                    f"{name}: Pitch {result.requested_pitch_deg:.2f} -> "
-                    f"{result.recommended_pitch_deg:.2f}, J5 {result.requested_j5_deg:.2f} -> "
+                    f"{name}: Yaw {result.requested_yaw_deg:.2f} -> "
+                    f"{result.recommended_yaw_deg:.2f}, J5 {result.requested_j5_deg:.2f} -> "
                     f"{result.recommended_j5_deg:.2f}"
                 )
-                changed = changed or result.changed_pitch or result.changed_j5
+                changed = changed or result.changed_yaw
             if not changed:
                 messagebox.showinfo("姿态推荐", "\n".join(messages) + "\n\n当前目标已有可行解。")
                 return
@@ -2083,8 +2080,8 @@ class ArmDashboard(tk.Tk):
                     if result is None:
                         continue
                     panel = self.left_target if name == "left" else self.right_target
-                    panel.set_recommended_pitch_j5(
-                        result.recommended_pitch_deg,
+                    panel.set_recommended_yaw_j5(
+                        result.recommended_yaw_deg,
                         result.recommended_j5_deg,
                     )
 
@@ -2481,8 +2478,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--left-channel", type=int, default=1)
     parser.add_argument("--left-gripper-channel", type=int, default=2)
-    parser.add_argument("--right-channel", type=int, default=3)
-    parser.add_argument("--right-gripper-channel", type=int, default=4)
+    parser.add_argument("--right-channel", type=int, default=1)
+    parser.add_argument("--right-gripper-channel", type=int, default=2)
     parser.add_argument(
         "--left-gripper-enabled",
         action=argparse.BooleanOptionalAction,

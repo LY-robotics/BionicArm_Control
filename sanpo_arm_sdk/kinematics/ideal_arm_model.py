@@ -15,14 +15,13 @@ from .kinematic_5dof import (
     MDH_ALPHA_DEG,
     MDH_D_MM,
     TCP_OFFSET_WRIST_MM,
-    TCP_ROTATION_X_DEG,
+    TCP_ROTATION_WRIST,
     ArmPose,
     actual_to_mdh_theta,
     axis_order_correction_matrix,
     forward_kinematics,
     joint_array,
     modified_dh_matrix,
-    rotation_x_matrix,
     validate_joints,
 )
 
@@ -164,7 +163,7 @@ def build_ideal_arm_model(
         joint_transforms.append(_correct_transform(plane_transform, correction))
 
     wrist_to_tcp = np.eye(4, dtype=float)
-    wrist_to_tcp[:3, :3] = rotation_x_matrix(np.deg2rad(TCP_ROTATION_X_DEG))
+    wrist_to_tcp[:3, :3] = TCP_ROTATION_WRIST
     wrist_to_tcp[:3, 3] = TCP_OFFSET_WRIST_MM
     tcp_transform = joint_transforms[-1] @ wrist_to_tcp
 

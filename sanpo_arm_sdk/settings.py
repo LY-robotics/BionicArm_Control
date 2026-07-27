@@ -35,12 +35,11 @@ class CartesianLineDefaults:
 
 @dataclass(frozen=True)
 class RecommendationDefaults:
-    """Search grid used when the requested pitch/J5 pose has no IK solution."""
+    """Search grid used when the requested yaw has no IK solution."""
 
-    pitch_min_deg: float = -90.0
-    pitch_max_deg: float = 90.0
-    pitch_step_deg: float = 1.0
-    j5_step_deg: float = 2.0
+    yaw_min_deg: float = -180.0
+    yaw_max_deg: float = 180.0
+    yaw_step_deg: float = 1.0
 
 
 @dataclass(frozen=True)

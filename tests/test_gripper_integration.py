@@ -148,20 +148,20 @@ class GripperIntegrationTests(unittest.TestCase):
         self.assertEqual(endpoint.sent[-1][0], 1)
         self.assertEqual(endpoint.sent[-1][1], SET_ZERO_PAYLOAD)
 
-    def test_dual_f4_factory_binds_four_separate_can_channels(self) -> None:
+    def test_dual_f4_factory_uses_local_channels_on_separate_f4_ports(self) -> None:
         system = create_dual_f4_system(
             "LEFT_TEST",
             "RIGHT_TEST",
             left_arm_channel=1,
             left_gripper_channel=2,
-            right_arm_channel=3,
-            right_gripper_channel=4,
+            right_arm_channel=1,
+            right_gripper_channel=2,
         )
 
         self.assertEqual(system.arms.left.hardware.bus.channel, 1)
         self.assertEqual(system.grippers.left.transport.channel, 2)
-        self.assertEqual(system.arms.right.hardware.bus.channel, 3)
-        self.assertEqual(system.grippers.right.transport.channel, 4)
+        self.assertEqual(system.arms.right.hardware.bus.channel, 1)
+        self.assertEqual(system.grippers.right.transport.channel, 2)
         self.assertIs(
             system.arms.left.hardware.transport,
             system.grippers.left.transport.parent,

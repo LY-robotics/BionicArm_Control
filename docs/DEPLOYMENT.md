@@ -3,7 +3,7 @@
 本文面向一台没有安装过本项目的新电脑。完成后应能：
 
 1. 安装 `sanpo-arm-control` 及全部 Python 依赖。
-2. 运行 32 项离线单元测试和仿真自检。
+2. 运行 38 项离线单元测试和仿真自检。
 3. 启动图形控制台仿真模式。
 4. 识别双 F4 串口，并在人工核对后连接真机。
 
@@ -34,15 +34,15 @@ git clone git@github.com:LY-robotics/BionicArm_Control.git
 git clone https://github.com/LY-robotics/BionicArm_Control.git
 ```
 
-进入目录并固定到经过实机验证的发布版本：
+进入目录并固定到经过实机验证的 Yaw 运控版本：
 
 ```bash
 cd BionicArm_Control
-git checkout v1.0.0
+git checkout v1.1.0
 ```
 
-日常开发可以继续使用 `main`，生产设备建议固定 Tag，避免拉取尚未重新做过
-实机验证的提交。
+`v1.1.0` 是当前 Yaw 运控实机验证 Tag。生产设备建议固定使用该 Tag，
+不要直接跟随可能继续开发的 `main` 分支。
 
 ## 3. Windows 10/11
 
@@ -112,6 +112,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 不要沿用旧电脑的 COM25/COM26。Windows 在新电脑上分配的 COM 号可能不同，
 必须结合板卡背面说明和低风险单臂反馈测试重新确认左右 F4。
+
+每颗 F4 都独立使用本地 CAN Channel `1/2`：机械臂默认占用 `1`，夹爪默认
+占用 `2`。板卡丝印 CAN3 是第二颗 F4 的第一个 CAN 口，在右侧 F4 串口协议中
+仍填写 Channel `1`，不是 `3`。
 
 ## 4. Linux
 
@@ -210,10 +214,10 @@ sanpo-arm-smoke-test
 sanpo-arm-dashboard --simulate
 ```
 
-预期版本为 `1.0.0`，测试结尾为 `OK`，仿真自检输出：
+预期版本为 `1.1.0`，测试结尾为 `OK`，仿真自检输出：
 
 ```text
-SANPO Arm Control v1.0.0: smoke test passed
+SANPO Arm Control v1.1.0: smoke test passed
 ```
 
 测试和自检不接触真机，适合在任何新电脑上先验证软件环境。
@@ -277,7 +281,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 1. 左右 F4 串口是否接反。
 2. 是否选择 `ST` 而不是旧 `AT` 模式。
 3. 固件是否支持当前 ST 协议。
-4. Channel 是全局 1～4 还是当前固件的局部 1/2 映射。
+4. 当前 `v1.1.0` 实机配置是否保持本侧机械臂 Channel 1、夹爪 Channel 2。
 5. 电机 ID、夹爪 Motor ID 和 Master CAN ID。
 6. CAN_H/CAN_L、共地、终端电阻、设备供电和物理 CAN 波特率。
 7. 是否有另一个控制台、串口工具或系统服务正在占用串口。
@@ -303,7 +307,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-回退到实机验证版本：
+回退到上一版实机验证版本：
 
 ```bash
 git checkout v1.0.0

@@ -60,7 +60,7 @@ class DualLineTelemetryTests(unittest.TestCase):
             OK,
         )
         pose = forward_kinematics(source_joints)
-        target = [pose.x + 2.0, pose.y, pose.z, pose.pitch_deg, source_joints[4]]
+        target = [pose.x + 2.0, pose.y, pose.z, pose.yaw_deg, source_joints[4]]
         error, motion = arm.prepare_move_line(
             target,
             speed=1000.0,
@@ -72,13 +72,14 @@ class DualLineTelemetryTests(unittest.TestCase):
         self.assertIsNotNone(motion)
         self.assertLess(motion.line_plan.max_line_deviation_mm, 0.01)
         self.assertLessEqual(motion.line_plan.position_error_mm[-1], 0.1)
+        self.assertLessEqual(motion.line_plan.max_abs_yaw_error_deg, 0.5)
         self.assertEqual(arm.execute_prepared_motion(motion), OK)
         reached = forward_kinematics(
             [arm.hardware.positions[key] for key in arm.joints]
         )
         np.testing.assert_allclose(reached.position_mm, target[:3], atol=0.11)
 
-    def test_feasible_pose_recommendation_keeps_requested_pitch_and_j5(self) -> None:
+    def test_feasible_pose_recommendation_keeps_requested_yaw_and_j5(self) -> None:
         arm = self.dual.right
         source_joints = [-10.0, 15.0, 20.0, 30.0, 5.0]
         self.assertEqual(
@@ -87,11 +88,11 @@ class DualLineTelemetryTests(unittest.TestCase):
         )
         pose = forward_kinematics(source_joints)
         error, result = arm.preview_ik_recommendation(
-            [pose.x, pose.y, pose.z, pose.pitch_deg, source_joints[4]]
+            [pose.x, pose.y, pose.z, pose.yaw_deg, source_joints[4]]
         )
         self.assertEqual(error, OK)
         self.assertTrue(result.success)
-        self.assertFalse(result.changed_pitch)
+        self.assertFalse(result.changed_yaw)
         self.assertFalse(result.changed_j5)
 
     def test_feedback_records_peaks_and_exports_utf8_csv(self) -> None:

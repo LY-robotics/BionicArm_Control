@@ -26,13 +26,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--right-port", default="COM9")
     parser.add_argument("--left-arm-channel", type=int, default=1)
     parser.add_argument("--left-gripper-channel", type=int, default=2)
-    parser.add_argument("--right-arm-channel", type=int, default=3)
-    parser.add_argument("--right-gripper-channel", type=int, default=4)
+    parser.add_argument("--right-arm-channel", type=int, default=1)
+    parser.add_argument("--right-gripper-channel", type=int, default=2)
     parser.add_argument(
         "--target",
         type=float,
         nargs=5,
-        metavar=("X", "Y", "Z", "PITCH", "J5"),
+        metavar=("X", "Y", "Z", "YAW", "J5"),
     )
     parser.add_argument("--speed", type=float, default=10.0)
     parser.add_argument("--accel", type=float, default=20.0)
@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 def default_target() -> list[float]:
     joints = [-10.0, 15.0, 20.0, 30.0, 5.0]
     pose = forward_kinematics(joints)
-    return [pose.x, pose.y, pose.z, pose.pitch_deg, joints[4]]
+    return [pose.x, pose.y, pose.z, pose.yaw_deg, joints[4]]
 
 
 def main() -> None:

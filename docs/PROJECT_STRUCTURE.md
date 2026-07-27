@@ -47,7 +47,7 @@ F4 的 USB 串口及事务锁，但绑定不同 CAN Channel。它们没有共同
 ### 2.1 机械臂坐标控制
 
 ```text
-输入 [X, Y, Z, Pitch, J5]
+输入 [X, Y, Z, Yaw, J5]（Yaw 右正左负）
   -> ArmController.MoveCart / MoveLine
   -> kinematic_5dof.inverse_kinematics
   -> 逻辑关节角 [J1, J2, J3, J4, J5]
@@ -167,7 +167,7 @@ sanpo-arm-smoke-test
 | 文件 | 作用 |
 |---|---|
 | `kinematics/__init__.py` | 导出 FK、IK、推荐解、直线规划和理想模型接口 |
-| `kinematics/kinematic_5dof.py` | 五轴正逆运动学、连杆参数、关节范围、Pitch/J5 无解推荐 |
+| `kinematics/kinematic_5dof.py` | 五轴正逆运动学、145 mm 同轴夹爪 TCP、关节范围、Yaw 无解推荐 |
 | `kinematics/guiji_quintic.py` | 五次多项式时间律、关节轨迹和点到点笛卡尔目标规划 |
 | `kinematics/cartesian_line.py` | TCP 直线采样、连续 IK 分支选择、速度/加速度校验和自动延时 |
 | `kinematics/ideal_arm_model.py` | 理想连杆、Base/J1～J5/TCP 坐标系、目标/理论/反馈 TCP 比较和 CSV 导出 |
@@ -222,6 +222,7 @@ sanpo-arm-smoke-test
 | `tests/test_motion_chain.py` | 坐标到 IK、轨迹、仿真硬件的单臂完整链路 |
 | `tests/test_dual_line_telemetry.py` | 双臂共同时间、TCP 直线、推荐解、反馈峰值和 CSV |
 | `tests/test_ideal_arm_model.py` | 连杆长度、坐标系正交右手性、FK 一致性和误差导出 |
+| `tests/test_yaw_kinematics.py` | Yaw 右正左负、J5 与 TCP/Yaw 解耦、FK/IK 回代 |
 | `tests/test_gripper_integration.py` | Gloria 编码、反馈识别、PV 模式、设零确认、双 Channel 和可选夹爪 |
 
 测试全部使用仿真对象或内存串口，不会连接真机。

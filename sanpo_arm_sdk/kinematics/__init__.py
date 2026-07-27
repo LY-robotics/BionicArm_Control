@@ -22,7 +22,7 @@ from .kinematic_5dof import (
     JointAngle,
     forward_kinematics,
     inverse_kinematics,
-    recommend_feasible_pitch_j5,
+    recommend_feasible_yaw,
 )
 
 __all__ = [
@@ -46,5 +46,5 @@ __all__ = [
     "plan_cartesian_line_trajectory",
     "plan_cartesian_point_to_point_trajectory",
     "plan_quintic_joint_trajectory_by_limits",
-    "recommend_feasible_pitch_j5",
+    "recommend_feasible_yaw",
 ]

@@ -4,7 +4,7 @@
 双夹爪、实时反馈和 `can_motor_arm_lib.py` 通信协议已经分层，不再依赖
 原工程的 `ControlCAN.dll` 调用链。
 
-当前稳定版本：`v1.0.0`。
+当前实机验证版本：`v1.1.0`（TCP 姿态参数由 Pitch 切换为 Yaw）。
 
 新电脑部署和新维护者阅读入口：
 
@@ -90,7 +90,7 @@ sanpo_arm_control/
 │  │  ├─ can_backend.py             ArmHardware 到 CanArm 的适配器
 │  │  └─ simulated_backend.py       不接真机的内存仿真后端
 │  ├─ kinematics/
-│  │  ├─ kinematic_5dof.py          正解、逆解、无解姿态推荐
+│  │  ├─ kinematic_5dof.py          XYZ/Yaw/J5 正逆解与无解 Yaw 推荐
 │  │  ├─ guiji_quintic.py           关节五次轨迹与 MoveCart 点到点规划
 │  │  ├─ cartesian_line.py          TCP 直线采样和连续分支 IK
 │  │  └─ ideal_arm_model.py         理想连杆、Base/J1~J5/TCP 坐标系
@@ -104,6 +104,7 @@ sanpo_arm_control/
    ├─ test_motion_chain.py          单臂 MoveJ/MoveCart 完整链路
    ├─ test_dual_line_telemetry.py   双臂、直线插补、推荐解和反馈导出
    ├─ test_ideal_arm_model.py       连杆长度、坐标系和正解一致性
+   ├─ test_yaw_kinematics.py        Yaw 方向、J5 解耦和 FK/IK 回代
    └─ test_gripper_integration.py   夹爪协议、通道隔离和双侧整链路
 ```
 
@@ -132,21 +133,26 @@ sanpo_arm_control/
 
 ### MoveCart
 
-输入 `[x, y, z, pitch, j5]`。只在目标点做一次逆解，得到目标关节角后执行
+输入 `[x, y, z, yaw, j5]`。只在目标点做一次逆解，得到目标关节角后执行
 MoveJ 式五次轨迹。
 
 适合快速到达坐标点。目标 TCP 正确，但中间 TCP 路径不保证是直线。
 
-`preview_ik_recommendation()` 会先尝试原始 pitch/J5；无解时先固定 J5 搜索
-最近 pitch，再搜索最近的 pitch/J5 组合。GUI 可以预览并把推荐值写回输入框。
+Yaw 以 `+Y` 前方为 `0°`，**正角度向右、负角度向左**。J5 是绕夹爪
+进给轴的滚转角，不改变抓取中心位置或 Yaw。
+
+`config.py` 和底层协议里仍可看到 `Shoulder_Pitch`、`Elbow_Pitch`，它们是
+实体关节类型名称，不是已经废弃的 TCP Pitch 输入参数。
+
+`preview_ik_recommendation()` 会先尝试原始 Yaw/J5；无解时保持 J5 不变，
+搜索最近的可行 Yaw。GUI 可以预览并把推荐值写回输入框。
 
 ### MoveLine
 
 先从当前 TCP 到目标 TCP 生成五次时间律直线采样点，再对每个采样点连续求
 逆解。求解器会参考上一点和预测点选择同一 IK 分支，并限制相邻关节跳变。
-
-TCP 位置和 J5 是每点硬约束；pitch 是参考曲线。原因是五轴机构通常无法在
-任意直线的每一点同时严格满足位置、pitch 和固定 J5。
+TCP 位置、Yaw 和 J5 都是每个采样点的约束；Yaw 按最短角度方向从当前值
+平滑过渡到目标值。
 
 规划器会根据采样关节速度/加速度自动延长过短轨迹，不能通过把时长填得很小
 绕过限速。
@@ -186,8 +192,8 @@ python arm_dashboard.py `
   --usb-mode standard `
   --left-channel 1 `
   --left-gripper-channel 2 `
-  --right-channel 3 `
-  --right-gripper-channel 4 `
+  --right-channel 1 `
+  --right-gripper-channel 2 `
   --no-left-gripper-enabled `
   --right-gripper-enabled
 ```
@@ -299,8 +305,10 @@ angle_deg, speed_rpm, current_a, error_code
 - 上臂长度：`350 mm`
 - 前臂长度：`250 mm`
 - 肩部基准偏置：`[0, 0, -18] mm`
-- 腕部到 TCP 偏置：`[0, -50.9117, 84.9117] mm`
-- TCP 固定绕局部 X 轴旋转：`45°`
+- 腕部到抓取中心：沿腕部局部 `+Z` 方向 `145 mm`
+- 夹爪进给轴：TCP 局部 `+Z`
+- Yaw 定义：`atan2(进给轴 Z 分量, 进给轴 Y 分量)`，右正左负
+- J5：绕进给轴滚转，只改变手指方向，不改变抓取中心和 Yaw
 
 `build_ideal_arm_model(q_deg)` 输出：
 
@@ -345,7 +353,7 @@ if feedback_model is not None:
 
 图形控制台“理论模型”页的流程：
 
-1. 选择左臂或右臂，输入 `X/Y/Z/Pitch/J5`。
+1. 选择左臂或右臂，输入 `X/Y/Z/Yaw/J5`（Yaw 右正左负）。
 2. 点击“计算理论模型”，得到 IK 关节角、理论 TCP 和全部坐标系。
 3. 点击“读取反馈对比”，读取编码器关节角并通过正运动学计算反馈 TCP。
 4. 查看目标到理论、目标到反馈、理论到反馈的误差和误差向量。
@@ -407,9 +415,9 @@ sanpo-arm-smoke-test
 右 F4 串口 -> 右侧两个 CAN 口 -> 右机械臂 / 右 GloriaGripper
 ```
 
-SANPO V4 官方 USB 协议把物理口全局编号为 CAN1～CAN4，但部分固件实测会在
-每颗 F4 对应的 COM 口内使用局部 Channel 1/2。通道编号必须以 `AT+VER` 返回的
-固件和只读探测结果为准，GUI 中可以修改。四个设备对象
+板上丝印使用全局 CAN1～CAN4，但当前实机固件在每颗 F4 对应的 COM 口内都使用
+局部 Channel 1/2：机械臂为 1、夹爪为 2。右侧丝印 CAN3/CAN4 在右 F4 串口中
+仍分别填写 1/2。四个设备对象
 相互独立。同侧机械臂和夹爪只共享 F4 的 USB 串口及事务锁，不共享 CAN 口，
 夹爪代码也不会进入运动学或关节轨迹调用链。
 
@@ -435,8 +443,8 @@ system = create_dual_f4_system(
     "COM9",
     left_arm_channel=1,
     left_gripper_channel=2,
-    right_arm_channel=3,
-    right_gripper_channel=4,
+    right_arm_channel=1,
+    right_gripper_channel=2,
     left_gripper_enabled=False,
     right_gripper_enabled=True,
 )

@@ -30,8 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--channels",
         type=int,
         nargs="+",
-        default=[1, 2, 3, 4],
-        help="ST channel numbers to probe; default: 1 2 3 4",
+        default=[1, 2],
+        help="local ST channel numbers to probe; default: 1 2",
     )
     parser.add_argument("--timeout", type=float, default=0.5)
     parser.add_argument("--debug", action="store_true")

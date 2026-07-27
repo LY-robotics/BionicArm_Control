@@ -1,20 +1,19 @@
 """Forward and inverse kinematics for the 5-DOF tendon-driven arm.
 
-This module provides the single stable kinematics entry point for SDK code.
+Task-space convention
+---------------------
+The public Cartesian pose is ``[x, y, z, yaw, j5]``:
 
-Base coordinate convention:
-    +x: vertically downward
-    +y: forward
-    +z: right
+* ``x/y/z`` describe the gripper grasp center in millimetres.
+* ``yaw`` describes the horizontal direction of the gripper approach axis.
+* ``j5`` rolls the fingers about that approach axis.
 
-Actual joint convention:
-    J1: left positive, right negative
-    J2: forward positive, backward negative
-    J3: clockwise positive, counterclockwise negative
-    J4: elbow flexion positive
-    J5: counterclockwise positive, clockwise negative
+The shoulder base frame is ``+X`` down, ``+Y`` forward and ``+Z`` right.
+Consequently yaw is zero when the gripper points forward, positive when it
+turns right and negative when it turns left.  J5 does not change TCP position
+or yaw because the 145 mm gripper offset lies on the J5 rotation axis.
 
-Lengths and positions use millimetres. Joint inputs use degrees.
+Joint inputs and orientation values use degrees.
 """
 
 from __future__ import annotations
@@ -31,10 +30,14 @@ ArrayLike = Iterable[float] | np.ndarray
 UPPER_ARM_MM = 350.0
 FOREARM_MM = 250.0
 BASE_OFFSET_MM = np.array([0.0, 0.0, -18.0], dtype=float)
-TCP_OFFSET_WRIST_MM = np.array([0.0, -50.9117, 84.9117], dtype=float)
-TCP_ROTATION_X_DEG = 45.0
+GRIPPER_TCP_DISTANCE_MM = 145.0
+TCP_OFFSET_WRIST_MM = np.array(
+    [0.0, 0.0, GRIPPER_TCP_DISTANCE_MM],
+    dtype=float,
+)
+TCP_ROTATION_WRIST = np.eye(3, dtype=float)
 
-# Compatibility name retained for earlier code.
+# Compatibility name retained for earlier geometry callers.
 GRIPPER_OFFSET_WRIST_MM = TCP_OFFSET_WRIST_MM
 
 # Limits converted from the supplied mechanical-limit table.
@@ -45,18 +48,27 @@ JOINT_MAX_DEG = np.array([40.7, 144.0, 160.0, 140.0, 45.0], dtype=float)
 MDH_ALPHA_DEG = np.full(5, -90.0, dtype=float)
 MDH_A_MM = np.zeros(5, dtype=float)
 MDH_D_MM = np.array(
-    [0.0, 0.0, UPPER_ARM_MM, 0.0, FOREARM_MM], dtype=float
+    [0.0, 0.0, UPPER_ARM_MM, 0.0, FOREARM_MM],
+    dtype=float,
 )
+
+# Below this horizontal projection, yaw becomes physically ill-conditioned.
+YAW_SINGULARITY_PROJECTION = 1e-8
 
 
 def as_vector(values: ArrayLike, size: int, name: str) -> np.ndarray:
-    """Return ``values`` as a finite 1-D float vector of ``size``."""
+    """Return ``values`` as a finite one-dimensional vector."""
     array = np.asarray(values, dtype=float).reshape(-1)
     if array.size != size:
         raise ValueError(f"{name} must contain {size} values")
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must contain finite values")
     return array
+
+
+def wrap_angle_deg(angle_deg: float) -> float:
+    """Wrap an angle to ``[-180, 180)`` degrees."""
+    return float((float(angle_deg) + 180.0) % 360.0 - 180.0)
 
 
 @dataclass(frozen=True)
@@ -69,7 +81,8 @@ class JointAngle:
 
     def as_array(self) -> np.ndarray:
         return np.array(
-            [self.j1, self.j2, self.j3, self.j4, self.j5], dtype=float
+            [self.j1, self.j2, self.j3, self.j4, self.j5],
+            dtype=float,
         )
 
     @classmethod
@@ -80,7 +93,7 @@ class JointAngle:
 
 @dataclass(frozen=True)
 class ArmPose:
-    """Pose of the terminal TCP, with the wrist pose retained for inspection."""
+    """Pose of the gripper grasp center, retaining the wrist pose."""
 
     position_mm: np.ndarray
     rotation: np.ndarray
@@ -103,46 +116,68 @@ class ArmPose:
         return float(self.position_mm[2])
 
     @property
-    def gripper_axis(self) -> np.ndarray:
-        """Compatibility name for the terminal tool-axis unit vector."""
+    def approach_axis(self) -> np.ndarray:
+        """Gripper approach axis: TCP-local +Z from wrist to grasp center."""
         return self.rotation[:, 2].copy()
+
+    @property
+    def finger_axis(self) -> np.ndarray:
+        """Reference left-right finger axis: TCP-local +X."""
+        return self.rotation[:, 0].copy()
+
+    @property
+    def gripper_axis(self) -> np.ndarray:
+        return self.approach_axis
 
     @property
     def tool_axis(self) -> np.ndarray:
-        """Unit vector of the final 45-degree terminal segment."""
-        return self.rotation[:, 2].copy()
+        return self.approach_axis
 
     @property
-    def pitch_deg(self) -> float:
-        """Terminal elevation: 0 deg horizontal, +90 deg vertically down."""
-        return gripper_pitch_deg(self.rotation)
+    def yaw_horizontal_projection(self) -> float:
+        axis = self.approach_axis
+        return float(np.hypot(axis[1], axis[2]))
+
+    @property
+    def yaw_is_defined(self) -> bool:
+        return self.yaw_horizontal_projection > YAW_SINGULARITY_PROJECTION
+
+    @property
+    def yaw_deg(self) -> float:
+        """Horizontal yaw: zero forward, positive right, negative left."""
+        return gripper_yaw_deg(self.rotation)
 
 
 @dataclass(frozen=True)
 class IKOptions:
     position_tolerance_mm: float = 1e-3
-    pitch_tolerance_deg: float = 1e-3
-    pitch_weight_mm_per_rad: float = 100.0
+    yaw_tolerance_deg: float = 1e-3
+    yaw_weight_mm_per_rad: float = 100.0
     max_iterations: int = 500
     damping: float = 1e-2
     max_step_deg: float = 5.0
     nullspace_gain: float = 0.15
     jacobian_step_rad: float = 1e-5
     stagnation_iterations: int = 30
+    yaw_projection_min: float = 1e-5
 
     def __post_init__(self) -> None:
         if self.position_tolerance_mm <= 0.0:
             raise ValueError("position_tolerance_mm must be positive")
-        if self.pitch_tolerance_deg <= 0.0:
-            raise ValueError("pitch_tolerance_deg must be positive")
-        if self.pitch_weight_mm_per_rad <= 0.0:
-            raise ValueError("pitch_weight_mm_per_rad must be positive")
+        if self.yaw_tolerance_deg <= 0.0:
+            raise ValueError("yaw_tolerance_deg must be positive")
+        if self.yaw_weight_mm_per_rad <= 0.0:
+            raise ValueError("yaw_weight_mm_per_rad must be positive")
         if self.max_iterations <= 0 or self.stagnation_iterations <= 0:
             raise ValueError("Iteration counts must be positive")
         if self.damping <= 0.0 or self.max_step_deg <= 0.0:
             raise ValueError("damping and max_step_deg must be positive")
         if self.nullspace_gain < 0.0 or self.jacobian_step_rad <= 0.0:
             raise ValueError("Invalid null-space or Jacobian option")
+        if self.yaw_projection_min <= YAW_SINGULARITY_PROJECTION:
+            raise ValueError(
+                "yaw_projection_min must exceed YAW_SINGULARITY_PROJECTION"
+            )
 
 
 @dataclass(frozen=True)
@@ -152,10 +187,12 @@ class IKResult:
     position_mm: np.ndarray
     error_mm: np.ndarray
     error_norm_mm: float
-    pitch_deg: float
-    pitch_error_deg: float | None
-    target_pitch_deg: float | None
+    yaw_deg: float
+    yaw_error_deg: float | None
+    target_yaw_deg: float | None
     target_j5_deg: float
+    yaw_defined: bool
+    yaw_horizontal_projection: float
     iterations: int
     message: str
 
@@ -166,34 +203,27 @@ class IKResult:
 
 @dataclass(frozen=True)
 class PoseRecommendationOptions:
-    """Options for the hierarchical pitch-first pose recommendation."""
+    """Nearest-yaw search settings; J5 remains fixed."""
 
-    max_iterations: int = 800
-    secondary_gain: float = 0.30
-    max_step_deg: float = 3.0
-    position_tolerance_mm: float = 1e-3
-    jacobian_step_rad: float = 1e-5
+    yaw_min_deg: float = -180.0
+    yaw_max_deg: float = 180.0
+    yaw_step_deg: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.max_iterations <= 0:
-            raise ValueError("max_iterations must be positive")
-        if self.secondary_gain <= 0.0 or self.max_step_deg <= 0.0:
-            raise ValueError("secondary_gain and max_step_deg must be positive")
-        if self.position_tolerance_mm <= 0.0:
-            raise ValueError("position_tolerance_mm must be positive")
-        if self.jacobian_step_rad <= 0.0:
-            raise ValueError("jacobian_step_rad must be positive")
+        _validate_yaw_search(
+            self.yaw_min_deg,
+            self.yaw_max_deg,
+            self.yaw_step_deg,
+        )
 
 
 @dataclass(frozen=True)
 class PoseRecommendationResult:
-    """Strict IK result plus the nearest feasible pose when strict IK fails."""
-
     requested_result: IKResult
     recommended_result: IKResult | None
-    requested_pitch_deg: float
+    requested_yaw_deg: float
     requested_j5_deg: float
-    recommended_pitch_deg: float | None
+    recommended_yaw_deg: float | None
     recommended_j5_deg: float | None
     angular_distance_deg: float | None
     used_recommendation: bool
@@ -201,38 +231,47 @@ class PoseRecommendationResult:
 
     @property
     def success(self) -> bool:
-        return (
+        return bool(
             self.recommended_result is not None
             and self.recommended_result.success
         )
 
     @property
     def result(self) -> IKResult:
-        """Return the strict result, or the recommended result after fallback."""
-        if self.recommended_result is not None:
-            return self.recommended_result
-        return self.requested_result
+        return self.recommended_result or self.requested_result
 
 
 @dataclass(frozen=True)
 class IKRecommendConfig:
-    pitch_min_deg: float = -90.0
-    pitch_max_deg: float = 90.0
-    pitch_step_deg: float = 1.0
-    j5_step_deg: float = 1.0
+    """Search grid used when a requested yaw has no strict IK solution."""
+
+    yaw_min_deg: float = -180.0
+    yaw_max_deg: float = 180.0
+    yaw_step_deg: float = 1.0
+
+    def __post_init__(self) -> None:
+        _validate_yaw_search(
+            self.yaw_min_deg,
+            self.yaw_max_deg,
+            self.yaw_step_deg,
+        )
 
 
 @dataclass(frozen=True)
 class IKRecommendResult:
     success: bool
     ik_result: IKResult
-    requested_pitch_deg: float
+    requested_yaw_deg: float
     requested_j5_deg: float
-    recommended_pitch_deg: float
+    recommended_yaw_deg: float
     recommended_j5_deg: float
-    changed_pitch: bool
+    changed_yaw: bool
     changed_j5: bool
     message: str
+
+
+class YawSingularityError(RuntimeError):
+    """Raised when yaw is requested while the approach axis is vertical."""
 
 
 def joint_array(q: JointAngle | ArrayLike) -> np.ndarray:
@@ -267,7 +306,7 @@ def validate_joints(q: JointAngle | ArrayLike) -> np.ndarray:
 
 
 def actual_to_mdh_theta(q: JointAngle | ArrayLike) -> np.ndarray:
-    """Convert actual arm angles to modified-DH theta angles, in degrees."""
+    """Convert physical joint angles to modified-DH theta angles."""
     j1, j2, j3, j4, j5 = joint_array(q)
     return np.array(
         [j1, -j2 - 90.0, j3, j4 + 180.0, -j5 - 90.0],
@@ -294,28 +333,20 @@ def modified_dh_matrix(
     )
 
 
-def rotation_x_matrix(angle_rad: float) -> np.ndarray:
-    """Return a 3x3 right-handed rotation matrix about local x."""
-    c, s = np.cos(angle_rad), np.sin(angle_rad)
-    return np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, c, -s],
-            [0.0, s, c],
-        ],
-        dtype=float,
-    )
+def gripper_yaw_deg(rotation: np.ndarray) -> float:
+    """Return horizontal gripper yaw in the shoulder base frame.
 
-
-def gripper_pitch_deg(rotation: np.ndarray) -> float:
-    """Return gripper-axis pitch in the base coordinate system."""
+    The gripper approach axis is TCP-local +Z.  Its projection in the base
+    Y-Z plane gives ``yaw = atan2(approach_z, approach_y)``.  Base +Z points
+    right, so this directly implements positive-right and negative-left yaw.
+    """
     rotation_array = np.asarray(rotation, dtype=float)
     if rotation_array.shape != (3, 3):
         raise ValueError("rotation must be a 3x3 matrix")
+    if not np.all(np.isfinite(rotation_array)):
+        raise ValueError("rotation must contain finite values")
     axis = rotation_array[:, 2]
-    return float(
-        np.rad2deg(np.arctan2(axis[0], np.hypot(axis[1], axis[2])))
-    )
+    return wrap_angle_deg(np.rad2deg(np.arctan2(axis[2], axis[1])))
 
 
 def forward_kinematics_legacy(
@@ -323,7 +354,7 @@ def forward_kinematics_legacy(
     *,
     check_limits: bool = True,
 ) -> ArmPose:
-    """Calculate the original MDH terminal-TCP pose from actual joint angles."""
+    """Calculate the original-MDH gripper-TCP pose."""
     q_deg = joint_array(q)
     if check_limits:
         validate_joints(q_deg)
@@ -331,7 +362,6 @@ def forward_kinematics_legacy(
     theta_deg = actual_to_mdh_theta(q_deg)
     wrist_transform = np.eye(4, dtype=float)
     wrist_transform[:3, 3] = BASE_OFFSET_MM
-
     for alpha_deg, a_mm, d_mm, theta_i_deg in zip(
         MDH_ALPHA_DEG,
         MDH_A_MM,
@@ -346,10 +376,9 @@ def forward_kinematics_legacy(
         )
 
     wrist_to_tcp = np.eye(4, dtype=float)
-    wrist_to_tcp[:3, :3] = rotation_x_matrix(np.deg2rad(TCP_ROTATION_X_DEG))
+    wrist_to_tcp[:3, :3] = TCP_ROTATION_WRIST
     wrist_to_tcp[:3, 3] = TCP_OFFSET_WRIST_MM
     tcp_transform = wrist_transform @ wrist_to_tcp
-
     return ArmPose(
         position_mm=tcp_transform[:3, 3].copy(),
         rotation=tcp_transform[:3, :3].copy(),
@@ -362,15 +391,11 @@ def forward_kinematics_legacy(
 
 
 def rotation_y_for_j1(j1_deg: float) -> np.ndarray:
-    """J1 correction rotation identified from measured coupled J1/J2 motion."""
+    """J1 correction rotation identified from measured J1/J2 coupling."""
     angle_rad = np.deg2rad(-float(j1_deg))
     c, s = np.cos(angle_rad), np.sin(angle_rad)
     return np.array(
-        [
-            [c, 0.0, -s],
-            [0.0, 1.0, 0.0],
-            [s, 0.0, c],
-        ],
+        [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]],
         dtype=float,
     )
 
@@ -380,33 +405,27 @@ def rotation_z_for_j2(j2_deg: float) -> np.ndarray:
     angle_rad = np.deg2rad(float(j2_deg))
     c, s = np.cos(angle_rad), np.sin(angle_rad)
     return np.array(
-        [
-            [c, -s, 0.0],
-            [s, c, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
+        [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
         dtype=float,
     )
 
 
 def axis_order_correction_matrix(j1_deg: float, j2_deg: float) -> np.ndarray:
     """Return the measured J1/J2 axis-order correction matrix."""
-    rz_j2 = rotation_z_for_j2(j2_deg)
-    ry_j1 = rotation_y_for_j1(j1_deg)
-    rz_neg_j2 = rotation_z_for_j2(-j2_deg)
-    return rz_j2 @ ry_j1 @ rz_neg_j2
+    return (
+        rotation_z_for_j2(j2_deg)
+        @ rotation_y_for_j1(j1_deg)
+        @ rotation_z_for_j2(-j2_deg)
+    )
 
 
 def _apply_rotation_to_pose(pose: ArmPose, rotation: np.ndarray) -> ArmPose:
     tcp_transform = pose.transform.copy()
     wrist_transform = pose.wrist_transform.copy()
-
     tcp_transform[:3, :3] = rotation @ pose.rotation
     tcp_transform[:3, 3] = rotation @ pose.position_mm
-
     wrist_transform[:3, :3] = rotation @ pose.wrist_rotation
     wrist_transform[:3, 3] = rotation @ pose.wrist_position_mm
-
     return ArmPose(
         position_mm=tcp_transform[:3, 3].copy(),
         rotation=tcp_transform[:3, :3].copy(),
@@ -423,19 +442,18 @@ def forward_kinematics(
     *,
     check_limits: bool = True,
 ) -> ArmPose:
-    """Calculate the corrected terminal-TCP pose from actual joint angles."""
+    """Calculate the corrected gripper-TCP pose from physical joints."""
     q_deg = joint_array(q)
     if check_limits:
         validate_joints(q_deg)
 
-    j1_deg = float(q_deg[0])
-    j2_deg = float(q_deg[1])
-
     q_plane = q_deg.copy()
     q_plane[0] = 0.0
     plane_pose = forward_kinematics_legacy(q_plane, check_limits=False)
-
-    correction = axis_order_correction_matrix(j1_deg, j2_deg)
+    correction = axis_order_correction_matrix(
+        float(q_deg[0]),
+        float(q_deg[1]),
+    )
     return _apply_rotation_to_pose(plane_pose, correction)
 
 
@@ -459,15 +477,13 @@ def clip_joints(q: JointAngle | ArrayLike) -> np.ndarray:
     return np.clip(joint_array(q), JOINT_MIN_DEG, JOINT_MAX_DEG)
 
 
-def _validate_pitch(target_pitch_deg: float | None) -> float | None:
-    if target_pitch_deg is None:
+def _validate_yaw(target_yaw_deg: float | None) -> float | None:
+    if target_yaw_deg is None:
         return None
-    pitch = float(target_pitch_deg)
-    if not np.isfinite(pitch):
-        raise ValueError("target_pitch_deg must be finite")
-    if pitch < -90.0 or pitch > 90.0:
-        raise ValueError("target_pitch_deg must be within [-90, 90] deg")
-    return pitch
+    yaw = float(target_yaw_deg)
+    if not np.isfinite(yaw):
+        raise ValueError("target_yaw_deg must be finite")
+    return wrap_angle_deg(yaw)
 
 
 def _validate_j5(target_j5_deg: float | None, seed_j5_deg: float) -> float:
@@ -482,22 +498,29 @@ def _validate_j5(target_j5_deg: float | None, seed_j5_deg: float) -> float:
     return j5
 
 
+def _check_pose_yaw_valid(pose: ArmPose, projection_min: float) -> None:
+    if pose.yaw_horizontal_projection <= projection_min:
+        raise YawSingularityError(
+            "Gripper approach axis is too close to vertical; yaw is undefined"
+        )
+
+
 def task_jacobian(
     q: JointAngle | ArrayLike,
     *,
-    include_pitch: bool,
-    pitch_weight_mm_per_rad: float,
+    include_yaw: bool,
+    yaw_weight_mm_per_rad: float,
     step_rad: float = 1e-5,
+    yaw_projection_min: float = 1e-5,
 ) -> np.ndarray:
-    """Numerical Jacobian of [TCP x, y, z, weighted pitch] for J1-J4."""
+    """Numerical Jacobian of ``[TCP x, y, z, weighted yaw]`` for J1-J4."""
     q_deg = validate_joints(q)
     if step_rad <= 0.0:
         raise ValueError("step_rad must be positive")
 
-    rows = 4 if include_pitch else 3
+    rows = 4 if include_yaw else 3
     jacobian = np.zeros((rows, 4), dtype=float)
     step_deg = np.rad2deg(step_rad)
-
     for index in range(4):
         q_minus = q_deg.copy()
         q_plus = q_deg.copy()
@@ -512,15 +535,15 @@ def task_jacobian(
         jacobian[:3, index] = (
             pose_plus.position_mm - pose_minus.position_mm
         ) / delta_rad
-
-        if include_pitch:
-            pitch_delta_rad = np.deg2rad(
-                pose_plus.pitch_deg - pose_minus.pitch_deg
+        if include_yaw:
+            _check_pose_yaw_valid(pose_minus, yaw_projection_min)
+            _check_pose_yaw_valid(pose_plus, yaw_projection_min)
+            yaw_delta_rad = np.deg2rad(
+                wrap_angle_deg(pose_plus.yaw_deg - pose_minus.yaw_deg)
             )
             jacobian[3, index] = (
-                pitch_weight_mm_per_rad * pitch_delta_rad / delta_rad
+                yaw_weight_mm_per_rad * yaw_delta_rad / delta_rad
             )
-
     return jacobian
 
 
@@ -528,14 +551,13 @@ def position_jacobian(
     q: JointAngle | ArrayLike,
     step_rad: float = 1e-5,
 ) -> np.ndarray:
-    """Numerical TCP-position Jacobian in mm/rad for all five joints."""
+    """Numerical grasp-center position Jacobian in mm/rad."""
     q_deg = validate_joints(q)
     if step_rad <= 0.0:
         raise ValueError("step_rad must be positive")
 
     jacobian = np.zeros((3, 5), dtype=float)
     step_deg = np.rad2deg(step_rad)
-
     for index in range(5):
         q_minus = q_deg.copy()
         q_plus = q_deg.copy()
@@ -544,59 +566,27 @@ def position_jacobian(
         delta_rad = np.deg2rad(q_plus[index] - q_minus[index])
         if delta_rad == 0.0:
             continue
-
-        p_minus = forward_kinematics(q_minus, check_limits=False).position_mm
-        p_plus = forward_kinematics(q_plus, check_limits=False).position_mm
+        p_minus = forward_position(q_minus, check_limits=False)
+        p_plus = forward_position(q_plus, check_limits=False)
         jacobian[:, index] = (p_plus - p_minus) / delta_rad
-
     return jacobian
-
-
-def _position_and_pitch_jacobians(
-    q: np.ndarray,
-    step_rad: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Calculate position and terminal-pitch Jacobians in one FK pass."""
-    position_j = np.zeros((3, 5), dtype=float)
-    pitch_j = np.zeros(5, dtype=float)
-    step_deg = np.rad2deg(step_rad)
-
-    for index in range(5):
-        q_minus = q.copy()
-        q_plus = q.copy()
-        q_minus[index] = max(q[index] - step_deg, JOINT_MIN_DEG[index])
-        q_plus[index] = min(q[index] + step_deg, JOINT_MAX_DEG[index])
-        delta_rad = np.deg2rad(q_plus[index] - q_minus[index])
-        if delta_rad == 0.0:
-            continue
-
-        pose_minus = forward_kinematics(q_minus, check_limits=False)
-        pose_plus = forward_kinematics(q_plus, check_limits=False)
-        position_j[:, index] = (
-            pose_plus.position_mm - pose_minus.position_mm
-        ) / delta_rad
-        pitch_j[index] = np.deg2rad(
-            pose_plus.pitch_deg - pose_minus.pitch_deg
-        ) / delta_rad
-
-    return position_j, pitch_j
 
 
 def _make_ik_result(
     success: bool,
     q: np.ndarray,
     target_mm: np.ndarray,
-    target_pitch_deg: float | None,
+    target_yaw_deg: float | None,
     target_j5_deg: float,
     iterations: int,
     message: str,
 ) -> IKResult:
     pose = forward_kinematics(q, check_limits=False)
     error_mm = target_mm - pose.position_mm
-    pitch_error_deg = (
+    yaw_error_deg = (
         None
-        if target_pitch_deg is None
-        else float(target_pitch_deg - pose.pitch_deg)
+        if target_yaw_deg is None
+        else wrap_angle_deg(target_yaw_deg - pose.yaw_deg)
     )
     return IKResult(
         success=success,
@@ -604,10 +594,12 @@ def _make_ik_result(
         position_mm=pose.position_mm.copy(),
         error_mm=error_mm,
         error_norm_mm=float(np.linalg.norm(error_mm)),
-        pitch_deg=pose.pitch_deg,
-        pitch_error_deg=pitch_error_deg,
-        target_pitch_deg=target_pitch_deg,
+        yaw_deg=pose.yaw_deg,
+        yaw_error_deg=yaw_error_deg,
+        target_yaw_deg=target_yaw_deg,
         target_j5_deg=target_j5_deg,
+        yaw_defined=pose.yaw_is_defined,
+        yaw_horizontal_projection=pose.yaw_horizontal_projection,
         iterations=iterations,
         message=message,
     )
@@ -615,7 +607,7 @@ def _make_ik_result(
 
 def _solve_one_seed(
     target_mm: np.ndarray,
-    target_pitch_deg: float | None,
+    target_yaw_deg: float | None,
     target_j5_deg: float,
     q_seed_deg: np.ndarray,
     q_reference_deg: np.ndarray,
@@ -625,7 +617,7 @@ def _solve_one_seed(
     q_reference = clip_joints(q_reference_deg)
     q[4] = target_j5_deg
     q_reference[4] = target_j5_deg
-    include_pitch = target_pitch_deg is not None
+    include_yaw = target_yaw_deg is not None
     best_task_error = np.inf
     stagnant = 0
     iteration = 0
@@ -635,42 +627,55 @@ def _solve_one_seed(
         pose = forward_kinematics(q, check_limits=False)
         position_error = target_mm - pose.position_mm
         position_error_norm = float(np.linalg.norm(position_error))
-        pitch_error_deg = (
-            0.0
-            if target_pitch_deg is None
-            else float(target_pitch_deg - pose.pitch_deg)
-        )
 
-        position_ok = position_error_norm <= options.position_tolerance_mm
-        pitch_ok = (
-            not include_pitch
-            or abs(pitch_error_deg) <= options.pitch_tolerance_deg
+        if include_yaw and (
+            pose.yaw_horizontal_projection <= options.yaw_projection_min
+        ):
+            return _make_ik_result(
+                False,
+                q,
+                target_mm,
+                target_yaw_deg,
+                target_j5_deg,
+                iteration,
+                "Yaw is undefined because the approach axis is near vertical",
+            )
+
+        yaw_error_deg = (
+            0.0
+            if target_yaw_deg is None
+            else wrap_angle_deg(target_yaw_deg - pose.yaw_deg)
         )
-        if position_ok and pitch_ok:
-            task_name = "TCP position" if not include_pitch else "TCP pose"
+        position_ok = position_error_norm <= options.position_tolerance_mm
+        yaw_ok = (
+            not include_yaw
+            or abs(yaw_error_deg) <= options.yaw_tolerance_deg
+        )
+        if position_ok and yaw_ok:
+            task_name = "TCP position" if not include_yaw else "TCP position+yaw"
             return _make_ik_result(
                 True,
                 q,
                 target_mm,
-                target_pitch_deg,
+                target_yaw_deg,
                 target_j5_deg,
                 iteration,
                 f"{task_name} inverse kinematics converged",
             )
 
         error_parts = [position_error]
-        if include_pitch:
+        if include_yaw:
             error_parts.append(
                 np.array(
                     [
-                        options.pitch_weight_mm_per_rad
-                        * np.deg2rad(pitch_error_deg)
-                    ]
+                        options.yaw_weight_mm_per_rad
+                        * np.deg2rad(yaw_error_deg)
+                    ],
+                    dtype=float,
                 )
             )
         task_error = np.concatenate(error_parts)
         task_error_norm = float(np.linalg.norm(task_error))
-
         if task_error_norm < best_task_error - 1e-9:
             best_task_error = task_error_norm
             stagnant = 0
@@ -679,27 +684,35 @@ def _solve_one_seed(
             if stagnant >= options.stagnation_iterations:
                 break
 
-        jacobian = task_jacobian(
-            q,
-            include_pitch=include_pitch,
-            pitch_weight_mm_per_rad=options.pitch_weight_mm_per_rad,
-            step_rad=options.jacobian_step_rad,
-        )
+        try:
+            jacobian = task_jacobian(
+                q,
+                include_yaw=include_yaw,
+                yaw_weight_mm_per_rad=options.yaw_weight_mm_per_rad,
+                step_rad=options.jacobian_step_rad,
+                yaw_projection_min=options.yaw_projection_min,
+            )
+        except YawSingularityError:
+            break
+
         regularized = (
             jacobian @ jacobian.T
             + options.damping**2 * np.eye(jacobian.shape[0], dtype=float)
         )
-        jacobian_pinv = jacobian.T @ np.linalg.solve(
-            regularized, np.eye(jacobian.shape[0], dtype=float)
-        )
-        dq_task_rad = jacobian_pinv @ task_error
+        try:
+            jacobian_pinv = jacobian.T @ np.linalg.solve(
+                regularized,
+                np.eye(jacobian.shape[0], dtype=float),
+            )
+        except np.linalg.LinAlgError:
+            jacobian_pinv = np.linalg.pinv(jacobian)
 
+        dq_task_rad = jacobian_pinv @ task_error
         nullspace = np.eye(4, dtype=float) - jacobian_pinv @ jacobian
         reference_delta_rad = np.deg2rad(q_reference[:4] - q[:4])
         dq_rad = dq_task_rad + (
             options.nullspace_gain * nullspace @ reference_delta_rad
         )
-
         step_norm_deg = float(np.linalg.norm(np.rad2deg(dq_rad)))
         if step_norm_deg > options.max_step_deg:
             dq_rad *= options.max_step_deg / step_norm_deg
@@ -708,12 +721,12 @@ def _solve_one_seed(
         q = clip_joints(q)
         q[4] = target_j5_deg
 
-    mode = "TCP position" if not include_pitch else "TCP pose"
+    mode = "TCP position" if not include_yaw else "TCP position+yaw"
     return _make_ik_result(
         False,
         q,
         target_mm,
-        target_pitch_deg,
+        target_yaw_deg,
         target_j5_deg,
         min(iteration, options.max_iterations),
         f"{mode} inverse kinematics did not converge",
@@ -724,32 +737,27 @@ def inverse_kinematics(
     target_mm: ArrayLike,
     q_seed: JointAngle | ArrayLike,
     *,
-    target_pitch_deg: float | None = None,
+    target_yaw_deg: float | None = None,
     target_j5_deg: float | None = None,
     q_reference: JointAngle | ArrayLike | None = None,
     options: IKOptions | None = None,
     use_fallback_seeds: bool = True,
 ) -> IKResult:
-    """Solve the offset terminal TCP target.
+    """Solve grasp-center position and optional horizontal yaw.
 
-    ``target_pitch_deg`` is terminal-axis elevation: 0 deg is horizontal and
-    +90 deg is vertically down. ``target_j5_deg`` is the physical J5 command.
-    Omitting ``target_pitch_deg`` keeps position-only compatibility mode.
+    J1-J4 solve ``x/y/z/yaw``.  J5 is a fixed roll command and is not used as
+    an extra variable by the solver.
     """
     target = as_vector(target_mm, 3, "target_mm")
     seed = validate_joints(q_seed)
-    reference = (
-        seed.copy()
-        if q_reference is None
-        else validate_joints(q_reference)
-    )
-    target_pitch = _validate_pitch(target_pitch_deg)
+    reference = seed.copy() if q_reference is None else validate_joints(q_reference)
+    target_yaw = _validate_yaw(target_yaw_deg)
     target_j5 = _validate_j5(target_j5_deg, seed[4])
     solve_options = options or IKOptions()
 
     primary = _solve_one_seed(
         target,
-        target_pitch,
+        target_yaw,
         target_j5,
         seed,
         reference,
@@ -760,6 +768,7 @@ def inverse_kinematics(
 
     fallback_seeds = [
         reference,
+        np.array([0.0, 0.0, 0.0, 90.0, target_j5]),
         np.array([0.0, 0.0, 0.0, 30.0, target_j5]),
         np.array([-90.0, 30.0, 0.0, 90.0, target_j5]),
         np.array([0.0, 0.0, 90.0, 90.0, target_j5]),
@@ -767,12 +776,11 @@ def inverse_kinematics(
         np.array([-30.0, -30.0, -90.0, 90.0, target_j5]),
         np.array([40.0, 0.0, 0.0, 90.0, target_j5]),
     ]
-
     candidates: list[IKResult] = []
     for fallback in fallback_seeds:
         candidate = _solve_one_seed(
             target,
-            target_pitch,
+            target_yaw,
             target_j5,
             clip_joints(fallback),
             reference,
@@ -783,7 +791,6 @@ def inverse_kinematics(
 
     if not candidates:
         return primary
-
     joint_ranges = (JOINT_MAX_DEG - JOINT_MIN_DEG)[:4]
     return min(
         candidates,
@@ -793,147 +800,76 @@ def inverse_kinematics(
     )
 
 
-def _nearest_pose_from_seed(
-    target_mm: np.ndarray,
-    target_pitch_deg: float,
-    target_j5_deg: float,
-    seed_deg: np.ndarray,
-    options: PoseRecommendationOptions,
-) -> IKResult:
-    """Minimise pitch/J5 deviation while keeping TCP position primary."""
-    q = clip_joints(seed_deg)
-    target_secondary_rad = np.deg2rad(
-        np.array([target_pitch_deg, target_j5_deg], dtype=float)
+def _validate_yaw_search(
+    yaw_min_deg: float,
+    yaw_max_deg: float,
+    yaw_step_deg: float,
+) -> None:
+    values = np.asarray(
+        [yaw_min_deg, yaw_max_deg, yaw_step_deg],
+        dtype=float,
     )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("yaw search values must be finite")
+    if yaw_min_deg >= yaw_max_deg:
+        raise ValueError("yaw_min_deg must be smaller than yaw_max_deg")
+    if yaw_step_deg <= 0.0:
+        raise ValueError("yaw_step_deg must be positive")
 
-    for _ in range(1, options.max_iterations + 1):
-        pose = forward_kinematics(q, check_limits=False)
-        position_error = target_mm - pose.position_mm
-        position_j, pitch_j = _position_and_pitch_jacobians(
-            q, options.jacobian_step_rad
-        )
 
-        regularized = (
-            position_j @ position_j.T + 1e-4 * np.eye(3, dtype=float)
-        )
-        position_pinv = position_j.T @ np.linalg.solve(
-            regularized, np.eye(3, dtype=float)
-        )
-        nullspace = np.eye(5, dtype=float) - position_pinv @ position_j
+def _yaw_candidates_nearest(
+    target_yaw_deg: float,
+    yaw_min_deg: float,
+    yaw_max_deg: float,
+    yaw_step_deg: float,
+) -> list[float]:
+    """Return the bounded yaw grid ordered by circular angular distance."""
+    _validate_yaw_search(yaw_min_deg, yaw_max_deg, yaw_step_deg)
+    count = int(np.floor((yaw_max_deg - yaw_min_deg) / yaw_step_deg))
+    values = [yaw_min_deg + index * yaw_step_deg for index in range(count + 1)]
+    if values[-1] < yaw_max_deg - 1e-12:
+        values.append(yaw_max_deg)
 
-        current_secondary_rad = np.array(
-            [np.deg2rad(pose.pitch_deg), np.deg2rad(q[4])],
-            dtype=float,
-        )
-        secondary_error = target_secondary_rad - current_secondary_rad
-        secondary_j = np.vstack(
-            [pitch_j, np.array([0.0, 0.0, 0.0, 0.0, 1.0])]
-        )
-
-        dq_rad = position_pinv @ position_error
-        dq_rad += (
-            options.secondary_gain
-            * nullspace
-            @ secondary_j.T
-            @ secondary_error
-        )
-
-        step_norm_deg = float(np.linalg.norm(np.rad2deg(dq_rad)))
-        if step_norm_deg > options.max_step_deg:
-            dq_rad *= options.max_step_deg / step_norm_deg
-
-        q = clip_joints(q + np.rad2deg(dq_rad))
-
-    pose = forward_kinematics(q, check_limits=False)
-    position_error = target_mm - pose.position_mm
-    error_norm = float(np.linalg.norm(position_error))
-    success = error_norm <= options.position_tolerance_mm
-    return _make_ik_result(
-        success,
-        q,
-        target_mm,
-        pose.pitch_deg,
-        float(q[4]),
-        options.max_iterations,
-        (
-            "Closest feasible pitch/J5 search converged"
-            if success
-            else "Closest feasible pitch/J5 search did not reach the position"
+    unique: list[float] = []
+    seen: set[float] = set()
+    for value in values:
+        wrapped = wrap_angle_deg(value)
+        key = round(wrapped, 10)
+        if key not in seen:
+            seen.add(key)
+            unique.append(wrapped)
+    return sorted(
+        unique,
+        key=lambda yaw: (
+            abs(wrap_angle_deg(yaw - target_yaw_deg)),
+            abs(yaw),
         ),
     )
-
-
-def _integer_pitch_candidates(target_pitch_deg: float) -> list[float]:
-    """Return every integer pitch in [-90, 90], nearest target first."""
-    return sorted(
-        (float(pitch) for pitch in range(-90, 91)),
-        key=lambda pitch: (abs(pitch - target_pitch_deg), pitch),
-    )
-
-
-def _first_feasible_integer_pitch(
-    target_mm: np.ndarray,
-    target_pitch_deg: float,
-    fixed_j5_deg: float,
-    q_seed_deg: np.ndarray,
-    q_reference_deg: np.ndarray,
-    options: IKOptions | None,
-    *,
-    skip_requested_pitch: bool,
-) -> IKResult | None:
-    """Find the nearest feasible integer pitch while keeping J5 fixed."""
-    seed = q_seed_deg.copy()
-    seed[4] = fixed_j5_deg
-    reference = q_reference_deg.copy()
-    reference[4] = fixed_j5_deg
-
-    for integer_pitch in _integer_pitch_candidates(target_pitch_deg):
-        if skip_requested_pitch and np.isclose(
-            integer_pitch, target_pitch_deg, atol=1e-12
-        ):
-            continue
-
-        candidate = inverse_kinematics(
-            target_mm,
-            seed,
-            target_pitch_deg=integer_pitch,
-            target_j5_deg=fixed_j5_deg,
-            q_reference=reference,
-            options=options,
-        )
-        if candidate.success:
-            return candidate
-
-    return None
 
 
 def inverse_kinematics_with_recommendation(
     target_mm: ArrayLike,
     q_seed: JointAngle | ArrayLike,
     *,
-    target_pitch_deg: float,
+    target_yaw_deg: float,
     target_j5_deg: float,
     q_reference: JointAngle | ArrayLike | None = None,
     options: IKOptions | None = None,
     recommendation_options: PoseRecommendationOptions | None = None,
 ) -> PoseRecommendationResult:
-    """Solve the requested pose, or recommend the closest feasible pose."""
+    """Solve requested yaw or recommend the nearest feasible yaw."""
     target = as_vector(target_mm, 3, "target_mm")
     seed = validate_joints(q_seed)
-    reference = (
-        seed.copy()
-        if q_reference is None
-        else validate_joints(q_reference)
-    )
-    target_pitch = _validate_pitch(target_pitch_deg)
-    assert target_pitch is not None
-    target_j5 = _validate_j5(target_j5_deg, seed[4])
+    reference = seed.copy() if q_reference is None else validate_joints(q_reference)
+    requested_yaw = _validate_yaw(target_yaw_deg)
+    assert requested_yaw is not None
+    requested_j5 = _validate_j5(target_j5_deg, seed[4])
 
     requested = inverse_kinematics(
         target,
         seed,
-        target_pitch_deg=target_pitch,
-        target_j5_deg=target_j5,
+        target_yaw_deg=requested_yaw,
+        target_j5_deg=requested_j5,
         q_reference=reference,
         options=options,
     )
@@ -941,310 +877,158 @@ def inverse_kinematics_with_recommendation(
         return PoseRecommendationResult(
             requested_result=requested,
             recommended_result=requested,
-            requested_pitch_deg=target_pitch,
-            requested_j5_deg=target_j5,
-            recommended_pitch_deg=target_pitch,
-            recommended_j5_deg=target_j5,
+            requested_yaw_deg=requested_yaw,
+            requested_j5_deg=requested_j5,
+            recommended_yaw_deg=requested_yaw,
+            recommended_j5_deg=requested_j5,
             angular_distance_deg=0.0,
             used_recommendation=False,
             failure_reason=None,
         )
 
-    fixed_j5_result = _first_feasible_integer_pitch(
-        target,
-        target_pitch,
-        target_j5,
-        requested.q_deg,
-        reference,
-        options,
-        skip_requested_pitch=True,
-    )
-    if fixed_j5_result is not None:
-        recommended_pitch = int(round(fixed_j5_result.target_pitch_deg))
-        return PoseRecommendationResult(
-            requested_result=requested,
-            recommended_result=fixed_j5_result,
-            requested_pitch_deg=target_pitch,
-            requested_j5_deg=target_j5,
-            recommended_pitch_deg=recommended_pitch,
-            recommended_j5_deg=target_j5,
-            angular_distance_deg=abs(recommended_pitch - target_pitch),
-            used_recommendation=True,
-            failure_reason=(
-                "Requested TCP pose did not converge; keeping J5 fixed, "
-                "a feasible solution was found by changing only pitch."
-            ),
-        )
-
-    search_options = recommendation_options or PoseRecommendationOptions()
-    fallback_seeds = [
-        seed,
-        reference,
-        requested.q_deg,
-        np.array([0.0, 0.0, 0.0, 30.0, target_j5]),
-        np.array([-90.0, 30.0, 0.0, 90.0, target_j5]),
-        np.array([0.0, 0.0, 90.0, 90.0, target_j5]),
-        np.array([-30.0, -30.0, -90.0, 90.0, target_j5]),
-    ]
-
-    candidates = [
-        _nearest_pose_from_seed(
+    search = recommendation_options or PoseRecommendationOptions()
+    for candidate_yaw in _yaw_candidates_nearest(
+        requested_yaw,
+        search.yaw_min_deg,
+        search.yaw_max_deg,
+        search.yaw_step_deg,
+    ):
+        if abs(wrap_angle_deg(candidate_yaw - requested_yaw)) <= 1e-12:
+            continue
+        candidate = inverse_kinematics(
             target,
-            target_pitch,
-            target_j5,
-            clip_joints(candidate_seed),
-            search_options,
+            requested.q_deg,
+            target_yaw_deg=candidate_yaw,
+            target_j5_deg=requested_j5,
+            q_reference=reference,
+            options=options,
         )
-        for candidate_seed in fallback_seeds
-    ]
-    feasible = [candidate for candidate in candidates if candidate.success]
-
-    verified_integer_candidates: list[IKResult] = []
-    for continuous_candidate in feasible:
-        verified = _first_feasible_integer_pitch(
-            target,
-            target_pitch,
-            float(continuous_candidate.q_deg[4]),
-            continuous_candidate.q_deg,
-            continuous_candidate.q_deg,
-            options,
-            skip_requested_pitch=False,
-        )
-        if verified is not None:
-            verified_integer_candidates.append(verified)
-
-    if not verified_integer_candidates:
-        return PoseRecommendationResult(
-            requested_result=requested,
-            recommended_result=None,
-            requested_pitch_deg=target_pitch,
-            requested_j5_deg=target_j5,
-            recommended_pitch_deg=None,
-            recommended_j5_deg=None,
-            angular_distance_deg=None,
-            used_recommendation=False,
-            failure_reason=(
-                "Requested TCP pose did not converge. No verified integer "
-                "pitch solution was found after fixed-J5 and variable-J5 search."
-            ),
-        )
-
-    def angular_distance(candidate: IKResult) -> float:
-        return float(
-            np.hypot(
-                float(candidate.target_pitch_deg) - target_pitch,
-                candidate.target_j5_deg - target_j5,
+        if candidate.success:
+            distance = abs(wrap_angle_deg(candidate_yaw - requested_yaw))
+            return PoseRecommendationResult(
+                requested_result=requested,
+                recommended_result=candidate,
+                requested_yaw_deg=requested_yaw,
+                requested_j5_deg=requested_j5,
+                recommended_yaw_deg=candidate_yaw,
+                recommended_j5_deg=requested_j5,
+                angular_distance_deg=distance,
+                used_recommendation=True,
+                failure_reason=(
+                    "目标位置和航向角未收敛；保持 J5 不变时，"
+                    "已找到最近的可行航向角。"
+                ),
             )
-        )
-
-    verified = min(verified_integer_candidates, key=angular_distance)
-    recommended_pitch = int(round(verified.target_pitch_deg))
-    recommended_j5 = float(verified.target_j5_deg)
-
-    distance_to_limit = np.minimum(
-        verified.q_deg - JOINT_MIN_DEG,
-        JOINT_MAX_DEG - verified.q_deg,
-    )
-    if float(np.min(distance_to_limit)) <= 0.05:
-        reason = (
-            "No fixed-J5 integer pitch solution was found. A feasible integer "
-            "pitch was found after changing J5, but at least one joint is near "
-            "its limit."
-        )
-    else:
-        reason = (
-            "No fixed-J5 integer pitch solution was found. J5 was adjusted and "
-            "the recommended integer pitch/J5 pair passed strict IK validation."
-        )
 
     return PoseRecommendationResult(
         requested_result=requested,
-        recommended_result=verified,
-        requested_pitch_deg=target_pitch,
-        requested_j5_deg=target_j5,
-        recommended_pitch_deg=recommended_pitch,
-        recommended_j5_deg=recommended_j5,
-        angular_distance_deg=angular_distance(verified),
-        used_recommendation=True,
-        failure_reason=reason,
-    )
-
-
-def _validate_scalar(value: float, name: str) -> float:
-    value = float(value)
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    return value
-
-
-def _grid_candidates_nearest(
-    center: float,
-    lower: float,
-    upper: float,
-    step: float,
-) -> list[float]:
-    """Return bounded grid values, ordered from nearest to farthest."""
-    center = _validate_scalar(center, "center")
-    lower = _validate_scalar(lower, "lower")
-    upper = _validate_scalar(upper, "upper")
-    step = _validate_scalar(step, "step")
-
-    if lower > upper:
-        raise ValueError("lower must not be greater than upper")
-    if step <= 0.0:
-        raise ValueError("step must be positive")
-
-    start = int(np.ceil((lower - center) / step))
-    stop = int(np.floor((upper - center) / step))
-    values = [center + k * step for k in range(start, stop + 1)]
-    values = [float(np.clip(value, lower, upper)) for value in values]
-
-    unique_values = []
-    seen = set()
-    for value in values:
-        key = round(value, 10)
-        if key not in seen:
-            unique_values.append(value)
-            seen.add(key)
-
-    return sorted(
-        unique_values,
-        key=lambda value: (abs(value - center), abs(value)),
+        recommended_result=None,
+        requested_yaw_deg=requested_yaw,
+        requested_j5_deg=requested_j5,
+        recommended_yaw_deg=None,
+        recommended_j5_deg=None,
+        angular_distance_deg=None,
+        used_recommendation=False,
+        failure_reason=(
+            "航向角搜索范围内没有可行解。J5 仅控制夹爪滚转，"
+            "调整 J5 不能改善 TCP 位置和航向角的可解性。"
+        ),
     )
 
 
 def _make_recommend_result(
     ik_result: IKResult,
-    requested_pitch_deg: float,
+    requested_yaw_deg: float,
     requested_j5_deg: float,
-    recommended_pitch_deg: float,
-    recommended_j5_deg: float,
+    recommended_yaw_deg: float,
     message: str,
 ) -> IKRecommendResult:
     return IKRecommendResult(
         success=bool(ik_result.success),
         ik_result=ik_result,
-        requested_pitch_deg=float(requested_pitch_deg),
+        requested_yaw_deg=float(requested_yaw_deg),
         requested_j5_deg=float(requested_j5_deg),
-        recommended_pitch_deg=float(recommended_pitch_deg),
-        recommended_j5_deg=float(recommended_j5_deg),
-        changed_pitch=not np.isclose(
-            requested_pitch_deg, recommended_pitch_deg, atol=1e-9
+        recommended_yaw_deg=float(recommended_yaw_deg),
+        recommended_j5_deg=float(requested_j5_deg),
+        changed_yaw=(
+            abs(wrap_angle_deg(recommended_yaw_deg - requested_yaw_deg)) > 1e-9
         ),
-        changed_j5=not np.isclose(
-            requested_j5_deg, recommended_j5_deg, atol=1e-9
-        ),
+        changed_j5=False,
         message=message,
     )
 
 
-def recommend_feasible_pitch_j5(
+def recommend_feasible_yaw(
     target_tcp_mm: ArrayLike,
-    target_pitch_deg: float,
+    target_yaw_deg: float,
     target_j5_deg: float,
     q_seed: JointAngle | ArrayLike,
     *,
     q_reference: JointAngle | ArrayLike | None = None,
     config: IKRecommendConfig | None = None,
 ) -> IKRecommendResult:
-    """Recommend feasible pitch/J5 for a TCP target.
-
-    The search policy is:
-    1. Try the requested TCP + pitch + J5 target.
-    2. If it fails, keep J5 fixed and search the nearest bounded pitch.
-    3. If that fails, search the nearest bounded J5 and pitch pair.
-    """
+    """Recommend the nearest feasible yaw while keeping TCP and J5 fixed."""
     target = as_vector(target_tcp_mm, 3, "target_tcp_mm")
-    requested_pitch = _validate_scalar(target_pitch_deg, "target_pitch_deg")
-    requested_j5 = _validate_scalar(target_j5_deg, "target_j5_deg")
-    search_config = config or IKRecommendConfig()
-    reference = q_seed if q_reference is None else q_reference
+    seed = validate_joints(q_seed)
+    reference = seed.copy() if q_reference is None else validate_joints(q_reference)
+    requested_yaw = _validate_yaw(target_yaw_deg)
+    assert requested_yaw is not None
+    requested_j5 = _validate_j5(target_j5_deg, seed[4])
+    search = config or IKRecommendConfig()
 
     original = inverse_kinematics(
         target,
-        q_seed=q_seed,
-        target_pitch_deg=requested_pitch,
+        seed,
+        target_yaw_deg=requested_yaw,
         target_j5_deg=requested_j5,
         q_reference=reference,
     )
     if original.success:
         return _make_recommend_result(
             original,
-            requested_pitch,
+            requested_yaw,
             requested_j5,
-            requested_pitch,
-            requested_j5,
-            "Requested pitch and J5 are feasible",
+            requested_yaw,
+            "Requested yaw and J5 are feasible",
         )
 
-    pitch_candidates = _grid_candidates_nearest(
-        requested_pitch,
-        search_config.pitch_min_deg,
-        search_config.pitch_max_deg,
-        search_config.pitch_step_deg,
-    )
-
-    for pitch in pitch_candidates:
+    for candidate_yaw in _yaw_candidates_nearest(
+        requested_yaw,
+        search.yaw_min_deg,
+        search.yaw_max_deg,
+        search.yaw_step_deg,
+    ):
+        if abs(wrap_angle_deg(candidate_yaw - requested_yaw)) <= 1e-12:
+            continue
         candidate = inverse_kinematics(
             target,
-            q_seed=q_seed,
-            target_pitch_deg=pitch,
+            original.q_deg,
+            target_yaw_deg=candidate_yaw,
             target_j5_deg=requested_j5,
             q_reference=reference,
         )
         if candidate.success:
             return _make_recommend_result(
                 candidate,
-                requested_pitch,
+                requested_yaw,
                 requested_j5,
-                pitch,
-                requested_j5,
-                (
-                    "Requested target was infeasible; J5 was kept fixed and "
-                    "the nearest feasible pitch was recommended"
-                ),
+                candidate_yaw,
+                "Requested pose was infeasible; nearest feasible yaw recommended",
             )
-
-    j5_candidates = _grid_candidates_nearest(
-        requested_j5,
-        float(JOINT_MIN_DEG[4]),
-        float(JOINT_MAX_DEG[4]),
-        search_config.j5_step_deg,
-    )
-
-    for j5 in j5_candidates:
-        for pitch in pitch_candidates:
-            candidate = inverse_kinematics(
-                target,
-                q_seed=q_seed,
-                target_pitch_deg=pitch,
-                target_j5_deg=j5,
-                q_reference=reference,
-            )
-            if candidate.success:
-                return _make_recommend_result(
-                    candidate,
-                    requested_pitch,
-                    requested_j5,
-                    pitch,
-                    j5,
-                    (
-                        "Fixed-J5 pitch search was infeasible; the nearest "
-                        "bounded J5 and pitch pair was recommended"
-                    ),
-                )
 
     return _make_recommend_result(
         original,
-        requested_pitch,
+        requested_yaw,
         requested_j5,
-        requested_pitch,
-        requested_j5,
-        "No feasible recommendation was found within the pitch and J5 limits",
+        requested_yaw,
+        (
+            "No feasible yaw was found in the search range. J5 only controls "
+            "gripper roll and cannot improve position/yaw feasibility."
+        ),
     )
 
 
-# Compatibility names retained for existing calling code.
+# Compatibility names used by the original motion-control scripts.
 KIS = forward_kinematics
 KIS_inverse = inverse_kinematics
 
@@ -1255,6 +1039,7 @@ __all__ = [
     "BASE_OFFSET_MM",
     "FOREARM_MM",
     "GRIPPER_OFFSET_WRIST_MM",
+    "GRIPPER_TCP_DISTANCE_MM",
     "IKOptions",
     "IKRecommendConfig",
     "IKRecommendResult",
@@ -1270,8 +1055,10 @@ __all__ = [
     "PoseRecommendationOptions",
     "PoseRecommendationResult",
     "TCP_OFFSET_WRIST_MM",
-    "TCP_ROTATION_X_DEG",
+    "TCP_ROTATION_WRIST",
     "UPPER_ARM_MM",
+    "YAW_SINGULARITY_PROJECTION",
+    "YawSingularityError",
     "actual_to_mdh_theta",
     "as_vector",
     "axis_order_correction_matrix",
@@ -1280,17 +1067,17 @@ __all__ = [
     "forward_kinematics_legacy",
     "forward_position",
     "forward_wrist_position",
-    "gripper_pitch_deg",
+    "gripper_yaw_deg",
     "inverse_kinematics",
     "inverse_kinematics_with_recommendation",
     "joint_array",
     "joints_within_limits",
     "modified_dh_matrix",
     "position_jacobian",
-    "recommend_feasible_pitch_j5",
-    "rotation_x_matrix",
+    "recommend_feasible_yaw",
     "rotation_y_for_j1",
     "rotation_z_for_j2",
     "task_jacobian",
     "validate_joints",
+    "wrap_angle_deg",
 ]

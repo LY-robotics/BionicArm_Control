@@ -31,8 +31,9 @@ class CartesianLinePlan:
     target_position_mm: np.ndarray
     desired_position_mm: np.ndarray
     actual_position_mm: np.ndarray
-    nominal_pitch_deg: np.ndarray
-    actual_pitch_deg: np.ndarray
+    nominal_yaw_deg: np.ndarray
+    actual_yaw_deg: np.ndarray
+    yaw_error_deg: np.ndarray
     desired_j5_deg: np.ndarray
     position_error_mm: np.ndarray
     final_ik_result: IKResult
@@ -42,6 +43,10 @@ class CartesianLinePlan:
     @property
     def max_position_error_mm(self) -> float:
         return float(np.max(self.position_error_mm))
+
+    @property
+    def max_abs_yaw_error_deg(self) -> float:
+        return float(np.max(np.abs(self.yaw_error_deg)))
 
     @property
     def max_line_deviation_mm(self) -> float:
@@ -116,6 +121,7 @@ def _candidate_seeds(
 
 def _solve_continuous_sample(
     target_position_mm: np.ndarray,
+    target_yaw_deg: float,
     previous_q: np.ndarray,
     predicted_q: np.ndarray,
     target_j5_deg: float,
@@ -127,15 +133,25 @@ def _solve_continuous_sample(
     primary = inverse_kinematics(
         target_position_mm,
         q_seed=previous_q,
-        target_pitch_deg=None,
+        target_yaw_deg=target_yaw_deg,
         target_j5_deg=target_j5_deg,
         q_reference=previous_q,
         options=ik_options,
         use_fallback_seeds=False,
     )
     primary_jump = float(np.max(np.abs(primary.q_deg - previous_q)))
+    primary_yaw_ok = (
+        primary.yaw_error_deg is not None
+        and abs(primary.yaw_error_deg) <= ik_options.yaw_tolerance_deg
+    )
     if (
-        (primary.success or primary.error_norm_mm <= position_tolerance_mm)
+        (
+            primary.success
+            or (
+                primary.error_norm_mm <= position_tolerance_mm
+                and primary_yaw_ok
+            )
+        )
         and primary_jump <= max_branch_jump_deg
     ):
         return primary
@@ -145,20 +161,26 @@ def _solve_continuous_sample(
         result = inverse_kinematics(
             target_position_mm,
             q_seed=seed,
-            target_pitch_deg=None,
+            target_yaw_deg=target_yaw_deg,
             target_j5_deg=target_j5_deg,
             q_reference=previous_q,
             options=ik_options,
             use_fallback_seeds=False,
         )
-        if result.success or result.error_norm_mm <= position_tolerance_mm:
+        yaw_ok = (
+            result.yaw_error_deg is not None
+            and abs(result.yaw_error_deg) <= ik_options.yaw_tolerance_deg
+        )
+        if result.success or (
+            result.error_norm_mm <= position_tolerance_mm and yaw_ok
+        ):
             candidates.append(result)
 
     if not candidates:
         fallback = inverse_kinematics(
             target_position_mm,
             q_seed=previous_q,
-            target_pitch_deg=None,
+            target_yaw_deg=target_yaw_deg,
             target_j5_deg=target_j5_deg,
             q_reference=previous_q,
             options=ik_options,
@@ -175,7 +197,8 @@ def _solve_continuous_sample(
         prediction = float(np.linalg.norm((result.q_deg - predicted_q) / joint_range))
         return (
             jump_penalty + continuity + 0.25 * prediction,
-            result.error_norm_mm,
+            result.error_norm_mm
+            + abs(result.yaw_error_deg or 0.0) * 0.1,
             jump,
         )
 
@@ -213,7 +236,7 @@ def plan_cartesian_line_trajectory(
     q_start: ArrayLike,
     target_position_mm: ArrayLike,
     *,
-    reference_pitch_deg: float | None,
+    target_yaw_deg: float | None,
     target_j5_deg: float | None,
     velocity_limit_deg_s: ArrayLike | float,
     acceleration_limit_deg_s2: ArrayLike | float,
@@ -225,11 +248,11 @@ def plan_cartesian_line_trajectory(
     velocity_margin: float = 1.10,
     acceleration_margin: float = 1.10,
 ) -> CartesianLinePlan:
-    """Plan an offline TCP line while allowing pitch to follow a feasible curve.
+    """Plan an offline TCP line with position, yaw and J5 constraints.
 
-    TCP position and J5 are hard constraints at each sample.  Pitch is a
-    reference curve used for reporting because a five-axis arm cannot in
-    general satisfy position, pitch and J5 everywhere along an arbitrary line.
+    TCP position follows a quintic straight-line blend. Yaw follows the shortest
+    wrapped angular path from the live start direction to ``target_yaw_deg``.
+    J5 is interpolated independently as the gripper roll command.
     """
 
     q0 = validate_joints(q_start)
@@ -251,10 +274,10 @@ def plan_cartesian_line_trajectory(
     )
     start_pose = forward_kinematics(q0)
     start_position = start_pose.position_mm
-    pitch_target = (
-        float(start_pose.pitch_deg)
-        if reference_pitch_deg is None
-        else float(reference_pitch_deg)
+    yaw_target = (
+        float(start_pose.yaw_deg)
+        if target_yaw_deg is None
+        else float(target_yaw_deg)
     )
     j5_target = float(q0[4]) if target_j5_deg is None else float(target_j5_deg)
     if not JOINT_MIN_DEG[4] <= j5_target <= JOINT_MAX_DEG[4]:
@@ -263,7 +286,7 @@ def plan_cartesian_line_trajectory(
     target_probe = inverse_kinematics(
         target,
         q_seed=q0,
-        target_pitch_deg=None,
+        target_yaw_deg=yaw_target,
         target_j5_deg=j5_target,
         q_reference=q0,
     )
@@ -293,8 +316,15 @@ def plan_cartesian_line_trajectory(
         start_position
         + blend.reshape(-1, 1) * (target - start_position).reshape(1, 3)
     )
-    nominal_pitch = start_pose.pitch_deg + blend * (
-        pitch_target - start_pose.pitch_deg
+    yaw_delta = float(
+        (yaw_target - start_pose.yaw_deg + 180.0) % 360.0 - 180.0
+    )
+    nominal_yaw = np.array(
+        [
+            (start_pose.yaw_deg + value * yaw_delta + 180.0) % 360.0 - 180.0
+            for value in blend
+        ],
+        dtype=float,
     )
     desired_j5 = q0[4] + blend * (j5_target - q0[4])
 
@@ -302,13 +332,14 @@ def plan_cartesian_line_trajectory(
     q_path[0] = q0
     actual_position = np.zeros((point_count, 3), dtype=float)
     actual_position[0] = start_position
-    actual_pitch = np.zeros(point_count, dtype=float)
-    actual_pitch[0] = start_pose.pitch_deg
+    actual_yaw = np.zeros(point_count, dtype=float)
+    actual_yaw[0] = start_pose.yaw_deg
+    yaw_error = np.zeros(point_count, dtype=float)
     position_error = np.zeros(point_count, dtype=float)
     final_result: IKResult | None = None
     options = IKOptions(
         position_tolerance_mm=min(position_tolerance_mm, 0.1),
-        pitch_tolerance_deg=0.5,
+        yaw_tolerance_deg=0.5,
         max_iterations=220,
         stagnation_iterations=30,
         max_step_deg=4.0,
@@ -323,6 +354,7 @@ def plan_cartesian_line_trajectory(
         )
         result = _solve_continuous_sample(
             desired_position[index],
+            float(nominal_yaw[index]),
             previous_q,
             predicted_q,
             float(desired_j5[index]),
@@ -336,6 +368,11 @@ def plan_cartesian_line_trajectory(
                 f"line IK failed at point {index + 1}/{point_count}: "
                 f"position error {result.error_norm_mm:.3f} mm"
             )
+        if result.yaw_error_deg is None or abs(result.yaw_error_deg) > 0.5:
+            raise RuntimeError(
+                f"line IK yaw failed at point {index + 1}/{point_count}: "
+                f"yaw error {result.yaw_error_deg} deg"
+            )
         if jump > max_branch_jump_deg:
             raise RuntimeError(
                 f"line IK branch jump at point {index + 1}/{point_count}: "
@@ -343,7 +380,8 @@ def plan_cartesian_line_trajectory(
             )
         q_path[index] = result.q_deg
         actual_position[index] = result.position_mm
-        actual_pitch[index] = result.pitch_deg
+        actual_yaw[index] = result.yaw_deg
+        yaw_error[index] = float(result.yaw_error_deg)
         position_error[index] = result.error_norm_mm
         final_result = result
 
@@ -371,8 +409,9 @@ def plan_cartesian_line_trajectory(
         target_position_mm=target.copy(),
         desired_position_mm=desired_position,
         actual_position_mm=actual_position,
-        nominal_pitch_deg=nominal_pitch,
-        actual_pitch_deg=actual_pitch,
+        nominal_yaw_deg=nominal_yaw,
+        actual_yaw_deg=actual_yaw,
+        yaw_error_deg=yaw_error,
         desired_j5_deg=desired_j5,
         position_error_mm=position_error,
         final_ik_result=final_result,

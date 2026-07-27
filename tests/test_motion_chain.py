@@ -33,7 +33,7 @@ class MotionChainTests(unittest.TestCase):
     def test_coordinate_to_ik_to_can_backend_chain(self) -> None:
         source_joints = [-20.0, 20.0, 30.0, 45.0, 0.0]
         pose = forward_kinematics(source_joints)
-        target = [pose.x, pose.y, pose.z, pose.pitch_deg, source_joints[4]]
+        target = [pose.x, pose.y, pose.z, pose.yaw_deg, source_joints[4]]
 
         err = self.arm.MoveCart(
             target,
