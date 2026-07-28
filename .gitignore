@@ -1,0 +1,25 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+
+# CubeIDE local settings
+.settings/
+
+# Build files
+*.o
+*.d
+*.elf
+*.map
+*.list
+
+# Firmware output
+*.bin
+*.hex
+
+# Temporary files
+*.log
+*.tmp
+
+# OS files
+Thumbs.db
+.DS_Store
